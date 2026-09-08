@@ -371,7 +371,7 @@ def parse_corner_bom_rule(attr1: Optional[str],
     above is the only source of truth for instructions, so an unrecognized
     or blank code means "no rule", not a guess from attr1's free text.
     """
-    code = (attr2 or "").strip().upper()
+    code = _clean_attr(attr2).upper()
     rule = CORNER_BOM_RULES.get(code)
     if not rule:
         return None
@@ -379,5 +379,18 @@ def parse_corner_bom_rule(attr1: Optional[str],
         "RuleCode": code,
         "Name": rule["name"],
         "Instructions": rule["instructions"],
-        "Attr1Name": (attr1 or "").strip() or None,
+        "Attr1Name": _clean_attr(attr1) or None,
     }
+
+
+def _clean_attr(value) -> str:
+    """Coerce a Cin7/pandas attribute cell to a stripped string.
+
+    Products come from CSV via pandas, so blanks arrive as float NaN
+    (and numeric-looking codes may arrive as int/float) — never assume str.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float) and value != value:  # NaN
+        return ""
+    return str(value).strip()
