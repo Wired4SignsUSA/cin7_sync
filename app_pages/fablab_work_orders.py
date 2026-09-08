@@ -271,11 +271,48 @@ def _render_bom_rule_instructions(
 
 # ── Build-list manager (flags) ─────────────────────────────────────────
 
-def _get_flagged_skus() -> list[str]:
+def _get_flagged_skus(bom_parents: dict | None = None) -> list[str]:
+    """Manual build list ∪ every SKU whose CIN7 BOM carries an
+    OSC-865FABLAB-* service line (James, 2026-09-08: the BOM rule is the
+    source of truth — no list to maintain)."""
     import db
     flag_rows = [f for f in db.list_flags(active_only=True)
                  if f["flag_type"] == FABLAB_FLAG_TYPE]
-    return sorted({r["sku"] for r in flag_rows})
+    skus = {r["sku"] for r in flag_rows}
+    skus |= bom_service_skus(bom_parents)
+    return sorted(skus)
+
+
+def bom_service_skus(bom_parents: dict | None) -> set[str]:
+    """SKUs whose BOM includes an 865FabLab service component."""
+    out: set[str] = set()
+    for sku, comps in (bom_parents or {}).items():
+        if any(_is_service(str(c.get("ComponentSKU") or "")) for c in comps):
+            out.add(str(sku))
+    return out
+
+
+def _render_bom_setup_check(products: pd.DataFrame, bom_parents: dict) -> None:
+    """Fold-away warning listing BOMs that break James's setup rule
+    (see fablab_bom_audit.find_issues). Data is the daily BOM sync, so a
+    CIN7 fix shows here the next morning."""
+    try:
+        import fablab_bom_audit as fba
+        rows = [{"AssemblySKU": sku, "ComponentSKU": c.get("ComponentSKU")}
+                for sku, comps in (bom_parents or {}).items() for c in comps]
+        issues = fba.find_issues(products, pd.DataFrame(rows))
+    except Exception as exc:  # never block the planner on the audit
+        st.caption(f"BOM setup check unavailable: {exc}")
+        return
+    if not issues:
+        return
+    with st.expander(f"⚠️ BOM setup check — {len(issues)} item(s) to fix in CIN7",
+                     expanded=False):
+        st.caption("Corners are planned from their CIN7 BOM. These BOMs look "
+                   "wrong, so the planner skips or mis-prices them. Fix in "
+                   "CIN7; this list refreshes after the nightly BOM sync.")
+        st.dataframe(pd.DataFrame(issues)[["code", "sku", "name", "detail"]],
+                     hide_index=True, use_container_width=True)
 
 
 def _render_build_list_manager(
@@ -840,7 +877,8 @@ def render_fablab_work_orders(
 
     current_user = st.session_state.get("current_user", "").strip() or "anonymous"
     product_map = _rows_by_sku(products)
-    flagged_skus = _get_flagged_skus()
+    flagged_skus = _get_flagged_skus(bom_parents)
+    _render_bom_setup_check(products, bom_parents)
 
     if not flagged_skus:
         st.info(

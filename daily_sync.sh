@@ -84,6 +84,13 @@ echo "[$(stamp)] cin7_sync boms" >> "$LOG"
 python cin7_sync.py boms >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync boms FAILED (continuing)" >> "$LOG"
 
+# 2026-09-08 — James's rule: prompt him when a corner BOM is filled in
+# without the 865FabLab service line (or vice versa). Dedupes via
+# fablab_settings so each SKU is announced once until fixed.
+echo "[$(stamp)] fablab_bom_audit" >> "$LOG"
+python fablab_bom_audit.py --post >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] fablab_bom_audit FAILED (continuing)" >> "$LOG"
+
 # v2.67.43 — refresh the 30-day sale-header window daily. The
 # Overview tile "Sales invoiced (last 30d)" reads sales_last_30d_*
 # directly. Without this refresh the file goes stale (we observed

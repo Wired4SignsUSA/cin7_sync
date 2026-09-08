@@ -225,3 +225,26 @@ def test_compact_po_memo_fits_cin7_limit():
     assert "more (see assemblies)" in memo
     small = fa.compact_po_memo({"A": 2}, {"A": "FG-1"}, 2, header="h")
     assert "[FG-1] A x 2" in small and "more" not in small
+
+
+def test_bom_audit_rule_flags_missing_service_and_odd_service():
+    import pandas as pd
+    import fablab_bom_audit as fba
+    products = pd.DataFrame([
+        {"SKU": "LED-X-INSIDE90", "Name": "Corner X", "Category": "Accessories - Profiles - Joints"},
+        {"SKU": "LED-Y-INSIDE90", "Name": "Corner Y", "Category": "Accessories - Profiles - Joints"},
+        {"SKU": "LED-Z-2390", "Name": "Profile Z", "Category": "Profiles - Channels"},
+        {"SKU": "LED-BUY-JOINT", "Name": "Bought joint", "Category": "Accessories - Profiles - Joints"},
+    ])
+    boms = pd.DataFrame([
+        {"AssemblySKU": "LED-X-INSIDE90", "ComponentSKU": "LED-X-0609"},          # missing service
+        {"AssemblySKU": "LED-Y-INSIDE90", "ComponentSKU": "LED-Y-0609"},
+        {"AssemblySKU": "LED-Y-INSIDE90", "ComponentSKU": "OSC-865FABLAB-JOINT"},  # ok
+        {"AssemblySKU": "LED-Z-2390", "ComponentSKU": "OSC-865FABLAB-JOINT"},      # odd + service only
+        {"AssemblySKU": "LED-BUY-JOINT", "ComponentSKU": "SCREW-1"},               # not a cut piece: ignore
+    ])
+    issues = fba.find_issues(products, boms)
+    codes = {(r["code"], r["sku"]) for r in issues}
+    assert ("MISSING_SERVICE", "LED-X-INSIDE90") in codes
+    assert ("ODD_SERVICE", "LED-Z-2390") in codes
+    assert not any(r["sku"] in ("LED-Y-INSIDE90", "LED-BUY-JOINT") for r in issues)
