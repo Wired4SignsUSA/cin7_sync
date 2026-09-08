@@ -681,6 +681,14 @@ def check_po_authorised(apply: bool = True) -> dict:
             d["id"], cin7_po_number=po_number,
             slack_channel=CORNER_CHANNEL_ID, slack_ts=hts)
         stats["notified"] += 1
+        # Consolidated pick list + pack labels (James, 2026-09-08).
+        try:
+            import fablab_pick_pdf
+            docs = fablab_pick_pdf.post_docs(d["id"], channel_id=CORNER_CHANNEL_ID)
+            for e in docs.get("errors") or []:
+                stats["errors"].append(f"docs {po_number}: {e}")
+        except Exception as exc:  # noqa: BLE001
+            stats["errors"].append(f"docs {po_number}: {exc}")
 
         _odoo_step(d, po_number, total, desc_lines, order, hts, apply=True)
     return stats

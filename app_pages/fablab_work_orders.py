@@ -292,6 +292,27 @@ def bom_service_skus(bom_parents: dict | None) -> set[str]:
     return out
 
 
+def _render_order_docs(draft_id: int) -> None:
+    """Download buttons for the consolidated pick list and 2.25x1.25in
+    pack labels of a placed order (also posted to Slack by the worker)."""
+    try:
+        import fablab_pick_pdf
+        docs = fablab_pick_pdf.build_docs(draft_id)
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"Pick list / labels unavailable: {exc}")
+        return
+    c1, c2, _ = st.columns([1, 1, 3])
+    with c1:
+        st.download_button("📋 Pick list (PDF)", data=open(docs["pick_list"], "rb").read(),
+                           file_name=docs["pick_list"].name, mime="application/pdf",
+                           key=f"fablab_pick_pdf_{draft_id}")
+    with c2:
+        st.download_button(f"🏷️ {docs['label_count']} pack labels (PDF)",
+                           data=open(docs["labels"], "rb").read(),
+                           file_name=docs["labels"].name, mime="application/pdf",
+                           key=f"fablab_labels_pdf_{draft_id}")
+
+
 def _render_bom_setup_check(products: pd.DataFrame, bom_parents: dict) -> None:
     """Fold-away warning listing BOMs that break James's setup rule
     (see fablab_bom_audit.find_issues). Data is the daily BOM sync, so a
@@ -968,6 +989,7 @@ def render_fablab_work_orders(
     if draft_id and is_submitted:
         st.caption("This order has already been placed — quantities are "
                    "read-only.")
+        _render_order_docs(draft_id)
     elif draft_id and not can_edit:
         st.caption("Take the lock above to edit quantities.")
     edited_planner = st.data_editor(

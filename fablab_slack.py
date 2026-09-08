@@ -65,3 +65,45 @@ def post(text: str, channel_id: str = FABLAB_CHANNEL_ID,
         err = f"post error: {exc}"
         log.error(err)
         return None, err
+
+
+def upload_file(path, channel_id: str = FABLAB_CHANNEL_ID,
+                thread_ts: Optional[str] = None, title: str = "",
+                initial_comment: str = "") -> tuple[Optional[str], Optional[str]]:
+    """Upload a local file to Slack (files.getUploadURLExternal →
+    completeUploadExternal). Returns (file_id, error); never raises."""
+    import os as _os
+    token = _os.environ.get("SLACK_BOT_TOKEN", "").strip()
+    if not token:
+        return None, "SLACK_BOT_TOKEN not set"
+    try:
+        import requests
+        path = str(path)
+        name = _os.path.basename(path)
+        size = _os.path.getsize(path)
+        hdr = {"Authorization": f"Bearer {token}"}
+        r = requests.post("https://slack.com/api/files.getUploadURLExternal",
+                          headers=hdr, data={"filename": name, "length": size},
+                          timeout=30).json()
+        if not r.get("ok"):
+            return None, f"getUploadURLExternal: {r}"
+        with open(path, "rb") as fh:
+            up = requests.post(r["upload_url"], files={"file": (name, fh)}, timeout=120)
+        if up.status_code != 200:
+            return None, f"upload HTTP {up.status_code}"
+        payload = {"files": [{"id": r["file_id"], "title": title or name}],
+                   "channel_id": channel_id}
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
+        if initial_comment:
+            payload["initial_comment"] = initial_comment
+        done = requests.post("https://slack.com/api/files.completeUploadExternal",
+                             headers={**hdr, "Content-Type": "application/json"},
+                             json=payload, timeout=60).json()
+        if not done.get("ok"):
+            return None, f"completeUploadExternal: {done}"
+        return r["file_id"], None
+    except Exception as exc:  # noqa: BLE001
+        err = f"upload error: {exc}"
+        log.error(err)
+        return None, err
