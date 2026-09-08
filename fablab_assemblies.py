@@ -71,7 +71,7 @@ LABOR_PREFIX = "OSC-865FABLAB"   # any 865FabLab service SKU (e.g. -JOINT) is la
 
 def _is_labor(sku) -> bool:
     return str(sku or "").upper().startswith(LABOR_PREFIX)
-DEFAULT_LABOR_PRICE = 10.0
+DEFAULT_LABOR_PRICE = 15.0
 CORNER_CHANNEL_ID = os.environ.get(
     "SLACK_FABLAB_CORNER_CHANNEL_ID", fablab_slack.FABLAB_CHANNEL_ID)
 

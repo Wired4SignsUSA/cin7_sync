@@ -16,7 +16,7 @@ key is missing, so the CIN7/Slack side of the flow never depends on it):
   ODOO_API_KEY            Odoo API key (Settings → Account Security)
   ODOO_LABOR_PRODUCT_CODE default OSC-865FABLAB-LABOR (created on first
                           use as a service product if missing)
-  ODOO_LABOR_UNIT_PRICE   default 10.00 (only used when creating the
+  ODOO_LABOR_UNIT_PRICE   default 15.00 (only used when creating the
                           product; existing list_price is kept)
   ODOO_CUSTOMER_NAME      default "Wired4Signs USA"
 
@@ -100,7 +100,7 @@ class OdooClient:
             "name": name or code, "default_code": code, "type": "service",
             "sale_ok": True, "purchase_ok": False,
             "list_price": float(price if price is not None else
-                                os.environ.get("ODOO_LABOR_UNIT_PRICE", 10)),
+                                os.environ.get("ODOO_LABOR_UNIT_PRICE", 15)),
         })
         rows = self.search_read(
             "product.product", [["product_tmpl_id", "=", tmpl_id]],
