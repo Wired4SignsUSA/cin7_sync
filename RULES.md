@@ -162,6 +162,18 @@ the same caveat from this same function — keeping the dashboard and
 the Slack-facing report in agreement, per the standing rule that the
 two must always show the same information.
 
+**3.1.5 Monthly Metrics has ONE implementation: `engine/monthly_metrics.py`.**
+(James, 2026-09-10.) The Sales & Marketing > Monthly Metrics page renders
+from `engine.monthly_metrics.compute()`; `publish_monthly_metrics.py`
+(daily_sync.sh, after the dataset_mirror publish) computes the same
+table in the dashboard container and writes it to Postgres
+`dataset_files` as `monthly_metrics.csv`, `monthly_metrics.json` and
+`monthly_metrics_for_chatgpt.md`. Viktor's monthly financial report
+reads those keys — it must never re-derive these figures from CIN7 or
+QuickBooks itself. Change a formula in the engine module only; the page,
+the CSV/markdown exports and the published dataset move together.
+Tests: `tests/test_monthly_metrics.py`.
+
 **3.2 Unfulfilled sales reduce effective position.** Count `BACKORDERED + ORDERED + ORDERING` as unfulfilled units. Subtract from `OnHand + OnOrder − Allocated` before comparing against target to get the real reorder need.
 
 **3.3 Migration: retiring SKU sales roll forward to successor.** Discontinued/phased-out lines (Smokies, Cascade) have their historical demand rolled into the successor (Sierra38, Sierra65) with a configurable share %. UI for managing these lives in the Ordering page's Migrations expander. Store in `sku_migrations` table.

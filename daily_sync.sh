@@ -237,6 +237,15 @@ echo "[$(stamp)] dataset_mirror publish" >> "$LOG"
 python dataset_mirror.py publish >> "$LOG" 2>&1 || \
   echo "[$(stamp)] dataset_mirror publish FAILED (continuing)" >> "$LOG"
 
+# 2026-09-10 (James) — publish the Monthly Metrics table (the exact
+# figures the Sales & Marketing > Monthly Metrics page shows) to
+# dataset_files as monthly_metrics.csv / .json / _for_chatgpt.md, so
+# Viktor's monthly financial report reads the page's numbers rather
+# than re-deriving them. Same module the page renders from.
+echo "[$(stamp)] publish_monthly_metrics" >> "$LOG"
+python publish_monthly_metrics.py >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] publish_monthly_metrics FAILED (continuing)" >> "$LOG"
+
 verify_critical_csv "sales_last_30d_*.csv" "sales_last_30d CSV"
 verify_critical_csv "sale_lines_last_30d_*.csv" "sale_lines_last_30d CSV"
 verify_critical_csv "assemblies_last_30d_*.csv" "assemblies_last_30d CSV"

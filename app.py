@@ -20829,31 +20829,21 @@ elif page == "Monthly Metrics":
             "`python cin7_sync.py salelines --days 730` to populate."
         )
     else:
-        # --- Prep a sale_lines DataFrame typed for monthly grouping ----
-        sl = sale_lines.copy()
-        sl["InvoiceDate"] = _to_date(sl["InvoiceDate"]).dt.tz_localize(None)
-        sl["Quantity"]    = _to_num(sl["Quantity"]).fillna(0)
-        sl["Price"]       = _to_num(sl["Price"]).fillna(0)
-        sl["Discount"]    = _to_num(sl["Discount"]).fillna(0)
-        sl["Tax"]         = _to_num(sl["Tax"]).fillna(0)
-        sl["Total"]       = _to_num(sl["Total"]).fillna(0)
-        sl["AverageCost"] = _to_num(sl.get("AverageCost", 0)).fillna(0)
-        sl = sl.dropna(subset=["InvoiceDate"])
-        sl["MonthKey"] = sl["InvoiceDate"].dt.to_period("M")
-        # Exclude voided / credited / cancelled statuses to match the way
-        # Easy Insight counts (booked-and-kept sales only).
-        if "Status" in sl.columns:
-            bad_statuses = ("VOIDED", "CREDITED", "CANCELLED", "CANCELED")
-            stat_upper = sl["Status"].astype(str).str.upper()
-            sl = sl[~stat_upper.isin(bad_statuses)]
+        # 2026-09-10 — every figure on this page is computed by
+        # engine/monthly_metrics.py (pure pandas, no Streamlit). The
+        # same module feeds publish_monthly_metrics.py, which writes
+        # the table + LLM markdown to Postgres `dataset_files` nightly
+        # so Viktor's monthly financial report reads exactly what this
+        # page shows. Change a formula there, never here.
+        from engine.monthly_metrics import (
+            MonthlyMetricsInputs, compute as _mm_compute,
+            build_table as _mm_build_table, fmt_cell as _fmt_cell,
+            prepare_sale_lines as _mm_prepare, channel_options as _mm_channels,
+            SECTION_ORDER as _MM_SECTION_ORDER)
 
         # --- Controls: channel filter + window ------------------------
         cc1, cc2, cc3 = st.columns([2, 1, 1])
-        channels = ["(All channels)"]
-        if "SourceChannel" in sl.columns:
-            channels += sorted(
-                sl["SourceChannel"].dropna().astype(str).unique().tolist()
-            )
+        channels = _mm_channels(_mm_prepare(sale_lines))
         sel_channel = cc1.selectbox(
             "Source channel",
             options=channels,
@@ -20871,912 +20861,70 @@ elif page == "Monthly Metrics":
         show_ytd = cc3.toggle("Show YTD + Avg", value=True,
                               key="mm_show_ytd")
 
-        if sel_channel != "(All channels)" and "SourceChannel" in sl.columns:
-            sl = sl[sl["SourceChannel"].astype(str) == sel_channel]
-
-        # --- Build list of month-period columns (oldest → newest) -----
-        today_ts = pd.Timestamp(datetime.now().date())
-        current_month = today_ts.to_period("M")
-        months = pd.period_range(
-            end=current_month, periods=int(lookback_months), freq="M"
-        )
-        month_labels = [str(m) for m in months]   # e.g. "2026-04"
-
-        # --- Identify shipping-charge lines ----------------------------
-        # CIN7 stores shipping/freight as fake-SKU line items whose SKU or
-        # Name starts with "Shipping -", "Freight", etc. We exclude them
-        # from Quantity/COGS (they're not real product) but DO sum them
-        # into a separate Shipping Charged metric.
-        _ship_skus = sl["SKU"].astype(str).str.match(
-            r"(?i)^(shipping|freight|handling|delivery)", na=False)
-        _ship_names = sl["Name"].astype(str).str.match(
-            r"(?i)^(shipping|freight|handling|delivery)", na=False)
-        is_shipping = _ship_skus | _ship_names
-        sl_prod = sl[~is_shipping].copy()
-
-        # --- Aggregate sale_lines monthly ------------------------------
-        # Product-only aggregates (exclude shipping-charge lines).
-        gl = sl_prod.groupby("MonthKey")
-        sales_per_month    = gl["Total"].sum()
-        quantity_per_month = gl["Quantity"].sum()
-        discount_per_month = gl["Discount"].sum()
-        tax_per_month      = gl["Tax"].sum()
-        cogs_per_month     = (sl_prod["Quantity"] * sl_prod["AverageCost"]
-                               ).groupby(sl_prod["MonthKey"]).sum()
-        # Orders: count across BOTH product and shipping lines (one SaleID
-        # may have multiple lines including shipping).
-        orders_per_month   = sl.groupby("MonthKey")["SaleID"].nunique()
-        # v2.67.xxx — the App-side Shipping Charged/Cost/Margin header-
-        # delta computation that used to live here was removed along
-        # with Section 2's three shipping rows (see below) — James
-        # decided QuickBooks (Section 8, accounts 405/694) should be
-        # the one canonical shipping-margin figure shown on this page,
-        # rather than showing two structurally different numbers
-        # (this App-side calc excluded LTL freight cost) and confusing
-        # the management team about which to trust.
-        # `_sales_hdr` is still needed below (channel/SalesRepresentative
-        # mapping), independent of the removed shipping calc.
-        _sales_hdr = _load_longest_sales()
-
-        # Channel breakdown — count unique customers per month
-        cust_first_seen = (
-            sl.dropna(subset=["CustomerID"])
-              .groupby("CustomerID")["MonthKey"].min()
-        )
-        cust_last_seen = (
-            sl.dropna(subset=["CustomerID"])
-              .groupby("CustomerID")["MonthKey"].max()
-        )
-        new_customers = cust_first_seen.value_counts()
-
-        # Running customer count = unique customers seen through end of month
-        def _running_customers(m):
-            return int((cust_first_seen <= m).sum())
-
-        # Lost customers this month = last-seen was 3+ months ago relative
-        # to `m`, and they had purchased before. Simple definition: those
-        # whose last_seen == m-3 (they hadn't bought in 3 months by m's end).
-        def _lost_customers(m):
-            # Everyone whose last_seen == (m-3) — they'd gone 3 months without
-            # purchasing by end of month m.
-            target = m - 3
-            return int((cust_last_seen == target).sum())
-
-        # Repeat customer %: of orders in month m, how many came from
-        # customers with a prior purchase (before m)?
-        def _repeat_customer_pct(m):
-            month_df = sl[sl["MonthKey"] == m]
-            if month_df.empty:
-                return 0.0
-            # For each SaleID in this month, was the customer new or repeat?
-            month_customers = month_df["CustomerID"].dropna().unique()
-            repeat_count = 0
-            for cust in month_customers:
-                first = cust_first_seen.get(cust)
-                if first is not None and first < m:
-                    repeat_count += 1
-            total = len(month_customers)
-            return (repeat_count / total * 100) if total else 0.0
-
-        # --- Purchases aggregation (cost side) -------------------------
-        pl_mm = pd.DataFrame()
-        if not purchase_lines.empty:
-            pl_mm = purchase_lines.copy()
-            pl_mm["OrderDate"] = pd.to_datetime(
-                pl_mm["OrderDate"], errors="coerce")
-            pl_mm = pl_mm.dropna(subset=["OrderDate"])
-            pl_mm["Total"]     = _to_num(pl_mm.get("Total", 0)).fillna(0)
-            pl_mm["MonthKey"]  = pl_mm["OrderDate"].dt.to_period("M")
-
-        if not pl_mm.empty:
-            po_per_month = pl_mm.groupby("MonthKey")["PurchaseID"].nunique()
-            po_spend_per_month = pl_mm.groupby("MonthKey")["Total"].sum()
-        else:
-            po_per_month = pd.Series(dtype=float)
-            po_spend_per_month = pd.Series(dtype=float)
-
-        # --- Build the metrics DataFrame ------------------------------
-        # Rows = metric labels, columns = month strings.
-        def _get(series, m):
-            """Safe lookup of a Series indexed by Period, returning 0."""
+        # --- Gather inputs (db reads are best-effort, as before) -------
+        def _safe(fn, default):
             try:
-                v = series.get(m, 0)
-                return float(v) if pd.notna(v) else 0.0
-            except Exception:
-                return 0.0
-
-        rows: list = []
-
-        def _row(section, label, values, fmt="money"):
-            rows.append({
-                "Section": section,
-                "Metric":  label,
-                "Format":  fmt,
-                "Values":  values,
-            })
-
-        # Build per-month value lists in the same order as month_labels
-        def _per_month(fn):
-            return [fn(m) for m in months]
-
-        # v2.67.xxx — Discounts source-of-truth, shared by Section 1
-        # and Section 6 below. CIN7's sale_lines.Discount line-item
-        # proxy undercounts true Shopify discounts by 60-70% (Viktor
-        # audit, v2.67.303) — prefer the Shopify Admin API's own
-        # discount total once `shopify_discounts.py sync` has
-        # populated it, falling back to the CIN7 proxy until then.
-        try:
-            _shopify_disc = db.all_shopify_monthly_discounts() or {}
-        except Exception:  # noqa: BLE001
-            _shopify_disc = {}
-
-        def _discounts_for(m):
-            """Shopify API value if we have it; CIN7 proxy if not."""
-            k = str(m)
-            v = _shopify_disc.get(k)
-            if v is not None and float(v) > 0:
-                return float(v)
-            return abs(_get(discount_per_month, m))
-
-        # v2.67.298 — Adopted Viktor's PDF report layout (Wired4Signs
-        # USA — Monthly Financial Report). Page-1 sections (App
-        # data) come first, then page-2 canonical financials
-        # (QuickBooks + Cin7/DEAR + Shopify). Source tag in every
-        # section header so finance and commissions know at a
-        # glance which system each number comes from.
-
-        # ===== 1 · Sales Overview [App] ============================
-        # Live CIN7 sale_lines — operational view. Canonical QB-
-        # grounded equivalents live in section 6 below.
-        _row("1. Sales Overview [App]", "Sales $",
-             _per_month(lambda m: _get(sales_per_month, m)))
-        _row("1. Sales Overview [App]", "Sales $ with Tax",
-             _per_month(lambda m: _get(sales_per_month, m)
-                                   + _get(tax_per_month, m)))
-        _row("1. Sales Overview [App]", "# Orders",
-             _per_month(lambda m: _get(orders_per_month, m)),
-             fmt="int")
-        _row("1. Sales Overview [App]", "Quantity Sold",
-             _per_month(lambda m: _get(quantity_per_month, m)),
-             fmt="int")
-        _row("1. Sales Overview [App]", "COGS",
-             _per_month(lambda m: _get(cogs_per_month, m)))
-        _row("1. Sales Overview [App]", "Discounts",
-             _per_month(lambda m: -_discounts_for(m)))
-        _row("1. Sales Overview [App]", "Tax $",
-             _per_month(lambda m: _get(tax_per_month, m)))
-        _row("1. Sales Overview [App]", "Gross Profit",
-             _per_month(lambda m: _get(sales_per_month, m)
-                                   - _get(cogs_per_month, m)))
-        _row("1. Sales Overview [App]", "GP %",
-             _per_month(lambda m: (
-                 (_get(sales_per_month, m) - _get(cogs_per_month, m))
-                 / _get(sales_per_month, m) * 100
-                 if _get(sales_per_month, m) else 0.0)),
-             fmt="pct")
-
-        # ------------------------------------------------------
-        # v2.67.292 — QuickBooks-canonical rows. The Viktor audit
-        # (May 2026) found CIN7-derived figures drift materially
-        # from QB actuals (shipping charged 27-218% over, COGS up
-        # to 27% over for older months, Dec 25 sales gap $45k).
-        # QB is the reconciled financial source of truth — when
-        # available, treat it as canonical and show CIN7 as
-        # parallel "operational" data. Pulled by qbo_monthly_pl.py.
-        # v2.67.294 — pass the FULL mapping dict (numbers + names)
-        # so QB subtotal rows like "Total Income" / "Total COGS" /
-        # "Net Income" (which have no AcctNum) get captured too.
-        # ------------------------------------------------------
-        try:
-            _qbo_mappings = db.get_qbo_account_mappings() or {}
-            _qb_by_month = db.qbo_monthly_pl_summary_by_category(
-                _qbo_mappings) if _qbo_mappings else {}
-        except Exception:  # noqa: BLE001
-            _qb_by_month = {}
-
-        # v2.67.xxx — surface likely-incomplete QBO months instead of
-        # letting them look like a silent dashboard bug (see the Aug
-        # 2026 CIN7-QBO integration outage incident documented on
-        # db.qbo_monthly_pl_anomaly_months).
-        try:
-            _qb_anomaly_months = (
-                db.qbo_monthly_pl_anomaly_months(_qb_by_month)
-                if _qb_by_month else {})
-        except Exception:  # noqa: BLE001
-            _qb_anomaly_months = {}
-
-        def _qb(m, cat):
-            return float((_qb_by_month.get(str(m)) or {}).get(
-                cat, 0.0) or 0.0)
-
-        def _qb_has_data(cat):
-            return any(_qb(m, cat) for m in months)
-
-        def _qb_month_synced(m):
-            """True if qbo_monthly_pl.py has ever synced ANY row for
-            this month at all. `_qb(m, cat)`'s `.get(cat, 0.0) or 0.0`
-            fallback can't tell "$0 actually posted to this account
-            this month" apart from "this month has no QBO sync data
-            yet" — both render as a literal $0. Section 7 below uses
-            this to show "—" (no data) instead of a misleading $0 for
-            months that simply haven't been synced."""
-            return str(m) in _qb_by_month
-
-        def _qb_per_month(fn):
-            """Like _per_month, but for QuickBooks-sourced Section 7
-            rows: emits None (rendered as "—", distinct from a literal
-            $0) for any month with no qbo_monthly_pl sync data at
-            all, instead of silently defaulting through _qb()'s 0.0
-            fallback."""
-            return [(fn(m) if _qb_month_synced(m) else None)
-                     for m in months]
-
-        # QB-canonical Sales and a Reconciliation block used to
-        # live here (pre-v2.67.298). They've moved into sections 6
-        # (Sales & Adjustments) and 7 (Cost & Profitability) below,
-        # matching Viktor's report layout — leaving the App view
-        # (section 1 above) unduplicated.
-
-        # ===== 2 · Margins & Purchasing [App] =====================
-        # AOV and purchase activity. Shipping Charged/Cost/Margin used
-        # to be shown here too (CIN7 + ShipStation operational P&L),
-        # but were removed — James decided QuickBooks (section 8,
-        # accounts 405/694) should be the one shipping-margin figure
-        # shown, rather than this App-side calc (which excluded LTL
-        # freight cost) and section 8's figure disagreeing every month
-        # and confusing the management team about which to trust.
-        _row("2. Margins & Purchasing [App]", "Avg Order Value",
-             _per_month(lambda m: (
-                 _get(sales_per_month, m) / _get(orders_per_month, m)
-                 if _get(orders_per_month, m) else 0.0)))
-        _row("2. Margins & Purchasing [App]", "# of Purchases",
-             _per_month(lambda m: _get(po_per_month, m)),
-             fmt="int")
-        _row("2. Margins & Purchasing [App]", "Purchase $",
-             _per_month(lambda m: _get(po_spend_per_month, m)))
-
-        # ===== 8 · Shipping Detail [QuickBooks] ==================
-        # QB-canonical shipping P&L. Symmetric (acc 405 Sales-
-        # Shipping income vs acc 694 Shipping-Out cost) — no LTL
-        # gap. Margin % added so the buyer sees the percentage
-        # alongside the dollar figure.
-        if _qb_has_data("shipping_charged"):
-            _row("8. Shipping Detail [QuickBooks]",
-                 "Shipping Charged (QB 405)",
-                 _per_month(lambda m: _qb(m, "shipping_charged")))
-        if _qb_has_data("shipping_cost"):
-            _row("8. Shipping Detail [QuickBooks]",
-                 "Shipping-Out Cost (QB 694)",
-                 _per_month(lambda m: _qb(m, "shipping_cost")))
-        if (_qb_has_data("shipping_charged")
-                and _qb_has_data("shipping_cost")):
-            _row("8. Shipping Detail [QuickBooks]",
-                 "Shipping Margin",
-                 _per_month(lambda m: _qb(m, "shipping_charged")
-                                       - _qb(m, "shipping_cost")))
-            _row("8. Shipping Detail [QuickBooks]", "Margin %",
-                 _per_month(lambda m: (
-                     (_qb(m, "shipping_charged")
-                      - _qb(m, "shipping_cost"))
-                     / _qb(m, "shipping_charged") * 100
-                     if _qb(m, "shipping_charged") else 0.0)),
-                 fmt="pct")
-
-        # ===== 6 · Sales & Adjustments [QuickBooks] ==============
-        # Top-of-P&L revenue ladder per Viktor's layout:
-        #   Gross Sales (est.) = Net + Discounts
-        #   − Discounts (Shopify API; falls back to CIN7 proxy
-        #                 when Shopify discount data is missing)
-        #   = Net Sales (QB 400)
-        #   + Shipping Income (QB 405)
-        #   = Total Revenue (QB Total Income)
-        # v2.67.303 — Discounts row sources from Shopify Admin API
-        # (`shopify_monthly_discounts` table) when populated, same
-        # `_discounts_for` shared with Section 1's Discounts row
-        # above. Pre-fix it used the CIN7 line-discount proxy which
-        # undercounted by 60-70% (audit). Run `python
-        # shopify_discounts.py sync` to populate; the row
-        # auto-switches sources once data lands.
-        _disc_label = (
-            "Less: Discounts (Shopify Admin API)"
-            if _shopify_disc
-            else "Less: Discounts (CIN7 — proxy until Shopify "
-                  "sync runs)")
-
-        if _qb_has_data("sales"):
-            _row("6. Sales & Adjustments [QuickBooks]",
-                 "Gross Sales (est.)",
-                 _per_month(lambda m: _qb(m, "sales")
-                                       + _discounts_for(m)))
-            _row("6. Sales & Adjustments [QuickBooks]",
-                 _disc_label,
-                 _per_month(_discounts_for))
-            _row("6. Sales & Adjustments [QuickBooks]",
-                 "Net Sales (QB 400)",
-                 _per_month(lambda m: _qb(m, "sales")))
-        if _qb_has_data("shipping_charged"):
-            _row("6. Sales & Adjustments [QuickBooks]",
-                 "Shipping Income (QB 405)",
-                 _per_month(lambda m: _qb(m, "shipping_charged")))
-        if _qb_has_data("total_income"):
-            _row("6. Sales & Adjustments [QuickBooks]",
-                 "Total Revenue (QB Total Income)",
-                 _per_month(lambda m: _qb(m, "total_income")))
-
-        # ===== 7 · Cost & Profitability [QuickBooks] =============
-        # Full QB P&L bottom — Product COGS, Amazon fees, Inv adj,
-        # Total COGS, Gross Profit, GP %, OpEx, Operating Profit,
-        # Op Margin %, Net Income. The complete picture commission
-        # base will eventually freeze against.
-        # v2.67.xxx — rows here use _qb_per_month (not _per_month) so
-        # a month with no qbo_monthly_pl sync data renders "—" rather
-        # than a literal $0 — the two used to be indistinguishable,
-        # which is exactly how a real double-counted exclusion (see
-        # the netting tripwire in db.py) could hide behind an
-        # innocent-looking $0 / near-0 figure instead of an obvious
-        # gap.
-        if _qb_has_data("cogs"):
-            _row("7. Cost & Profitability [QuickBooks]",
-                 "Product COGS (QB 500)",
-                 _qb_per_month(lambda m: _qb(m, "cogs")))
-        if _qb_has_data("cogs_amazon_fees"):
-            _row("7. Cost & Profitability [QuickBooks]",
-                 "Amazon Fees (QB 502)",
-                 _qb_per_month(lambda m: _qb(m, "cogs_amazon_fees")))
-        if _qb_has_data("inventory_adjustment"):
-            _row("7. Cost & Profitability [QuickBooks]",
-                 "Inventory Adj (QB 550)",
-                 _qb_per_month(lambda m: _qb(m, "inventory_adjustment")))
-        if _qb_has_data("total_cogs"):
-            _row("7. Cost & Profitability [QuickBooks]",
-                 "Total COGS",
-                 _qb_per_month(lambda m: _qb(m, "total_cogs")))
-        if _qb_has_data("qb_gross_profit"):
-            _row("7. Cost & Profitability [QuickBooks]",
-                 "Gross Profit",
-                 _qb_per_month(lambda m: _qb(m, "qb_gross_profit")))
-            if _qb_has_data("total_income"):
-                _row("7. Cost & Profitability [QuickBooks]",
-                     "GP %",
-                     _qb_per_month(lambda m: (
-                         _qb(m, "qb_gross_profit")
-                         / _qb(m, "total_income") * 100
-                         if _qb(m, "total_income") else 0.0)),
-                     fmt="pct")
-        if _qb_has_data("qb_total_expenses"):
-            _row("7. Cost & Profitability [QuickBooks]",
-                 "Total OpEx",
-                 _qb_per_month(lambda m: _qb(m, "qb_total_expenses")))
-        if _qb_has_data("qb_net_operating_income"):
-            _row("7. Cost & Profitability [QuickBooks]",
-                 "Operating Profit",
-                 _qb_per_month(lambda m: _qb(m, "qb_net_operating_income")))
-            if _qb_has_data("total_income"):
-                _row("7. Cost & Profitability [QuickBooks]",
-                     "Op Margin %",
-                     _qb_per_month(lambda m: (
-                         _qb(m, "qb_net_operating_income")
-                         / _qb(m, "total_income") * 100
-                         if _qb(m, "total_income") else 0.0)),
-                     fmt="pct")
-        if _qb_has_data("qb_net_income"):
-            _row("7. Cost & Profitability [QuickBooks]",
-                 "Net Income (QB)",
-                 _qb_per_month(lambda m: _qb(m, "qb_net_income")))
-
-        # v2.67.295 — Channel rows from CIN7 SalesRep field.
-        # Amazon / eBay / Shopify / individual reps come in on the
-        # `SalesRepresentative` column. v2.67.296 — enrich sl_prod
-        # from the sales-headers CSV at load time (we already have
-        # 5 years of headers locally; the saleList endpoint
-        # populates SalesRepresentative on every sale). Avoids a
-        # multi-hour re-pull of sale_lines just to backfill this
-        # single column. New sale_lines syncs (post-v2.67.295)
-        # carry the column natively; this just fills the gap for
-        # historical CSVs.
-        if ("SalesRepresentative" not in sl_prod.columns
-                and not _sales_hdr.empty
-                and "SaleID" in sl_prod.columns
-                and "SalesRepresentative" in _sales_hdr.columns):
-            _rep_map = (_sales_hdr
-                .dropna(subset=["SaleID"])
-                .drop_duplicates("SaleID")
-                .set_index("SaleID")["SalesRepresentative"]
-                .to_dict())
-            sl_prod = sl_prod.assign(
-                SalesRepresentative=sl_prod["SaleID"].map(_rep_map))
-        elif ("SalesRepresentative" in sl_prod.columns
-                and not _sales_hdr.empty
-                and "SalesRepresentative" in _sales_hdr.columns
-                and "SaleID" in sl_prod.columns):
-            # Column exists but may be empty on rows that came in
-            # before v2.67.295 — fill nulls from the header map.
-            _rep_map = (_sales_hdr
-                .dropna(subset=["SaleID"])
-                .drop_duplicates("SaleID")
-                .set_index("SaleID")["SalesRepresentative"]
-                .to_dict())
-            _filled = sl_prod["SalesRepresentative"].fillna(
-                sl_prod["SaleID"].map(_rep_map))
-            sl_prod = sl_prod.assign(SalesRepresentative=_filled)
-        # ===== 5 · Revenue by Channel [Cin7/DEAR] ================
-        # ===== 9 · Order Counts [Cin7/DEAR] ======================
-        # v2.67.300 — channel bucketing was previously SalesRep-only,
-        # but CIN7 leaves SalesRep BLANK on Shopify orders (it's
-        # only set for Amazon / eBay marketplace orders and for
-        # phone/B2B sales tied to a staff rep). That made the
-        # Shopify channel row always $0. The right signal is
-        # `SourceChannel`, which CIN7 sets on every sale from its
-        # integration source — we then fall back to SalesRep for
-        # marketplace orders that route through a non-marketplace
-        # SourceChannel, and finally B2B/Direct for anything else.
-        # Both signals are already on sl_prod (no header join
-        # needed) — Shopify revenue now populates back to month 1.
-        def _channel_of_row(sc_val, sr_val) -> str:
-            sc = (str(sc_val) if sc_val is not None
-                  else "").strip().lower()
-            sr = (str(sr_val) if sr_val is not None
-                  else "").strip().upper()
-            # SourceChannel is the primary signal (set by CIN7's
-            # integration for every sale).
-            if "shopify" in sc:
-                return "Shopify"
-            if "amazon" in sc or sr == "AMAZON":
-                return "Amazon"
-            if "ebay" in sc or sr == "EBAY":
-                return "eBay"
-            if sr == "SHOPIFY":
-                return "Shopify"
-            # Everything else (no SourceChannel match, no
-            # marketplace SalesRep) = direct entry / phone / B2B.
-            return "B2B / Direct"
-
-        # v2.67.xxx — split the "Shopify" bucket into Online Store
-        # (a customer checking out themselves) vs. Draft Orders (the
-        # sales team drew up a quote in Shopify that later got paid/
-        # converted) — James wants this distinction, matching what
-        # Shopify's own Analytics shows.
-        #
-        # First attempt joined CIN7 sale_lines to the shopify_orders
-        # dataset by OrderNumber — wrong key. Confirmed via a live
-        # CIN7 API pull (2026-07-22): CIN7's own "OrderNumber" for a
-        # Shopify-channel sale is CIN7's OWN internal reference
-        # (e.g. "SO-56363"), unrelated to Shopify's order number.
-        # The actual Shopify order reference CIN7 exposes turned up
-        # in "CustomerReference" (e.g. "#42668") — but James pointed
-        # out the simpler, more robust fix: don't round-trip through
-        # CIN7 at all for this split. Shopify's own order data
-        # (already synced) already has TotalPrice + SourceName per
-        # order — compute Online Store / Draft Orders / Other (every
-        # other source_name — POS, the Shop app, mobile app, etc.,
-        # combined) revenue and counts DIRECTLY from that, all on the
-        # same Shopify-native basis. "Other" is a real sum of actual
-        # orders, not a leftover against CIN7's total — CIN7's
-        # sale_lines.Total is product-line-only (excludes shipping/
-        # tax) while Shopify's TotalPrice is the full order value, so
-        # the two totals are never expected to match exactly; using
-        # CIN7's total as the "other" residual was producing
-        # "Shopify Total" figures smaller than Online + Draft alone
-        # whenever Shopify's own total ran ahead of CIN7's for the
-        # month. "Total (CIN7)" below stays anchored on CIN7 (still
-        # ties to Section 1); "Shopify Total" here is Shopify's own
-        # rollup and will legitimately differ from CIN7's Shopify
-        # figure.
-        _shop_rev_by_month_source = pd.Series(dtype=float)
-        _shop_cnt_by_month_source = pd.Series(dtype="int64")
-        _shop_rev_by_month_total = pd.Series(dtype=float)
-        _shop_cnt_by_month_total = pd.Series(dtype="int64")
-        if (not shopify_orders.empty
-                and "CreatedAt" in shopify_orders.columns
-                and "SourceName" in shopify_orders.columns):
-            _so = shopify_orders.copy()
-            _so["_dt"] = pd.to_datetime(
-                _so["CreatedAt"], errors="coerce", utc=True
-            ).dt.tz_localize(None)
-            _so = _so.dropna(subset=["_dt"])
-            _so["MonthKey"] = _so["_dt"].dt.to_period("M")
-            _so["TotalPrice"] = pd.to_numeric(
-                _so.get("TotalPrice"), errors="coerce").fillna(0)
-            _shop_rev_by_month_source = _so.groupby(
-                ["MonthKey", "SourceName"])["TotalPrice"].sum()
-            _shop_cnt_by_month_source = _so.groupby(
-                ["MonthKey", "SourceName"]).size()
-            _shop_rev_by_month_total = _so.groupby(
-                "MonthKey")["TotalPrice"].sum()
-            _shop_cnt_by_month_total = _so.groupby("MonthKey").size()
-
-        def _shopify_split_rev(m):
-            online = float(_shop_rev_by_month_source.get((m, "web"), 0.0))
-            draft = float(_shop_rev_by_month_source.get(
-                (m, "shopify_draft_order"), 0.0))
-            total = float(_shop_rev_by_month_total.get(m, 0.0))
-            other = max(total - online - draft, 0.0)
-            return online, draft, other
-
-        def _shopify_split_cnt(m):
-            online = int(_shop_cnt_by_month_source.get((m, "web"), 0))
-            draft = int(_shop_cnt_by_month_source.get(
-                (m, "shopify_draft_order"), 0))
-            total = int(_shop_cnt_by_month_total.get(m, 0))
-            other = max(total - online - draft, 0)
-            return online, draft, other
-
-        _has_sc = "SourceChannel" in sl_prod.columns
-        _has_sr = "SalesRepresentative" in sl_prod.columns
-        if _has_sc or _has_sr:
-            _sc_col = (sl_prod["SourceChannel"] if _has_sc
-                       else pd.Series([""] * len(sl_prod),
-                                       index=sl_prod.index))
-            _sr_col = (sl_prod["SalesRepresentative"] if _has_sr
-                       else pd.Series([""] * len(sl_prod),
-                                       index=sl_prod.index))
-            _chans = pd.Series(
-                [_channel_of_row(sc, sr)
-                 for sc, sr in zip(_sc_col, _sr_col)],
-                index=sl_prod.index)
-            _slp_rev = sl_prod.assign(_chan=_chans)
-            _rev_by_chan_month = _slp_rev.groupby(
-                ["MonthKey", "_chan"])["Total"].sum()
-            _orders_by_chan_month = _slp_rev.groupby(
-                ["MonthKey", "_chan"])["SaleID"].nunique()
-
-            _other_channels = ["B2B / Direct", "Amazon", "eBay"]
-            _shopify_sub_labels = [
-                "Shopify (Online Store)", "Shopify (Draft Orders)",
-                "Shopify (Other/Unclassified)"]
-            _channels_in_order = _shopify_sub_labels + _other_channels
-
-            for _chan in _shopify_sub_labels:
-                _idx = _shopify_sub_labels.index(_chan)
-                _row("5. Revenue by Channel [Cin7/DEAR]", _chan,
-                     _per_month(lambda m, i=_idx:
-                                 _shopify_split_rev(m)[i]))
-            # James: Shopify's own total (Online + Draft + Other) —
-            # will legitimately differ from "Total (CIN7)" below
-            # since Shopify's TotalPrice includes shipping/tax that
-            # CIN7's product-line Total excludes.
-            _row("5. Revenue by Channel [Cin7/DEAR]", "Shopify Total",
-                 _per_month(lambda m: sum(_shopify_split_rev(m))))
-            for _chan in _other_channels:
-                _row("5. Revenue by Channel [Cin7/DEAR]", _chan,
-                     _per_month(
-                         lambda m, c=_chan: float(
-                             _rev_by_chan_month.get((m, c), 0)
-                             or 0)))
-            _row("5. Revenue by Channel [Cin7/DEAR]",
-                 "Total (CIN7)",
-                 _per_month(
-                     lambda m: float(sum(
-                         _rev_by_chan_month.get((m, c), 0) or 0
-                         for c in ["Shopify"] + _other_channels))))
-            if _qb_has_data("sales"):
-                _row("5. Revenue by Channel [Cin7/DEAR]",
-                     "Net Sales (QB 400)",
-                     _per_month(lambda m: _qb(m, "sales")))
-
-            for _chan in _shopify_sub_labels:
-                _idx = _shopify_sub_labels.index(_chan)
-                _cnt_label = (f"{_chan} Count" if "Order" in _chan
-                               else f"{_chan} Orders")
-                _row("9. Order Counts [Cin7/DEAR]", _cnt_label,
-                     _per_month(lambda m, i=_idx:
-                                 _shopify_split_cnt(m)[i]),
-                     fmt="int")
-            _row("9. Order Counts [Cin7/DEAR]", "Shopify Total Orders",
-                 _per_month(lambda m: sum(_shopify_split_cnt(m))),
-                 fmt="int")
-            for _chan in _other_channels:
-                _row("9. Order Counts [Cin7/DEAR]",
-                     f"{_chan} Orders",
-                     _per_month(
-                         lambda m, c=_chan: int(
-                             _orders_by_chan_month.get((m, c), 0)
-                             or 0)),
-                     fmt="int")
-            _row("9. Order Counts [Cin7/DEAR]", "Total Orders",
-                 _per_month(
-                     lambda m: int(sum(
-                         _orders_by_chan_month.get((m, c), 0) or 0
-                         for c in ["Shopify"] + _other_channels))),
-                 fmt="int")
-
-        # v2.67.298 — AOV, # of Purchases, Purchase $ all moved
-        # up into section 2 (Margins & Purchasing [App]) above.
-        # The duplicate stubs that used to live here were removed.
-
-        # ===== 3 · Customer Metrics [App] ========================
-        # Renamed to match Viktor's labels:
-        # - "Running Customer Count" (Viktor's term — kept even
-        #   though it's a cumulative ever-bought count; ambiguity
-        #   is documented in the methodology expander).
-        # - "Lost Customers (3mo)" — drops the trailing "silent".
-        _row("3. Customer Metrics [App]", "New Customers",
-             _per_month(lambda m: int(new_customers.get(m, 0))),
-             fmt="int")
-        _row("3. Customer Metrics [App]", "Running Customer Count",
-             _per_month(_running_customers),
-             fmt="int")
-        _row("3. Customer Metrics [App]", "Lost Customers (3mo)",
-             _per_month(_lost_customers),
-             fmt="int")
-        _row("3. Customer Metrics [App]", "Repeat Customer %",
-             _per_month(_repeat_customer_pct),
-             fmt="pct")
-
-        # v2.67.37 — use the shared headline-stock helper so the
-        # Monthly Metrics report ties exactly to the Overview tile
-        # and the Ordering page's "Current stock value". Sales-team
-        # commissions are computed off this report — the number has
-        # to be consistent across every page that displays it.
-        inv_value_now = _headline_stock_value(stock, products)
-
-        # End-of-month inventory per month (walking back from now).
-        # Reasoning: during month (m+1) we consumed COGS (reducing inventory
-        # by that amount) and received purchases (increasing inventory by
-        # that amount). So going BACKWARDS:
-        #   end_of_m  =  end_of_(m+1)  +  COGS(m+1)  −  purchases(m+1)
-        # i.e. inventory was HIGHER before the COGS happened, LOWER before
-        # the purchases arrived.
-        #
-        # CAVEAT: CIN7's AverageCost on sale lines includes landed costs
-        # (freight/duties) that are NOT in purchase Total (which is the
-        # ex-freight supplier invoice). This causes COGS > purchases by
-        # a systematic delta that compounds when walking back. Over 14
-        # months the drift is typically 30-80%, which is too much.
-        #
-        # NORMALISATION FIX: compute the raw walk-back, then rescale so
-        # it anchors on the current snapshot at one end and a sensible
-        # long-run average at the other end. We target "flat with
-        # reasonable drift" rather than the raw drift-heavy curve.
-        raw_end: dict = {}
-        running_inv = float(inv_value_now)
-        raw_end[current_month] = running_inv
-        for m in reversed(months[:-1]):
-            next_m = m + 1
-            pur_next  = _get(po_spend_per_month, next_m)
-            cogs_next = _get(cogs_per_month, next_m)
-            running_inv = running_inv + cogs_next - pur_next
-            raw_end[m] = running_inv
-
-        # Normalise: if the oldest raw value is wildly different from the
-        # current, damp the curve so the oldest ends up at a long-run
-        # "sensible" level — specifically: the geometric mean between
-        # current and the raw oldest value, but capped so the range
-        # (max − min) across all months is ≤ 25% of the current value
-        # (matches how actual balanced inventories behave).
-        end_of_month_inv: dict = {}
-        oldest_m = months[0]
-        raw_oldest = raw_end.get(oldest_m, inv_value_now)
-        target_oldest = (raw_oldest + inv_value_now) / 2.0   # damped
-        # 15% band — typical inventory fluctuation without major changes
-        cap_delta = 0.15 * max(inv_value_now, 1.0)
-        if abs(target_oldest - inv_value_now) > cap_delta:
-            target_oldest = inv_value_now + cap_delta * (
-                1 if target_oldest > inv_value_now else -1)
-        # Linear damping: each month's value is a blend between raw and
-        # the linearly-interpolated "ideal" between target_oldest and now.
-        n = len(months)
-        for idx, m in enumerate(months):
-            # alpha = 1.0 at current (keep raw), 0.0 at oldest (full damp
-            # to the target curve)
-            alpha = idx / max(n - 1, 1)
-            raw_v = raw_end.get(m, inv_value_now)
-            ideal = (target_oldest
-                     + (inv_value_now - target_oldest)
-                     * (idx / max(n - 1, 1)))
-            end_of_month_inv[m] = max(alpha * raw_v
-                                       + (1 - alpha) * ideal, 0.0)
-
-        # Average inventory value per month = mean of begin + end
-        # (begin of M = end of M−1). For the earliest month we don't
-        # have a "before" value, so we approximate with end-of-month only.
-        def _avg_inv(m):
-            end_v = end_of_month_inv.get(m, inv_value_now)
-            begin_v = end_of_month_inv.get(m - 1, end_v)
-            return (begin_v + end_v) / 2.0
-
-        _row("4. Inventory [App]", "Avg Inventory Value",
-             _per_month(_avg_inv))
-
-        # Stock turn = annualised COGS / avg inventory (per month)
-        _row("4. Inventory [App]", "Stock Turn (annualised)",
-             _per_month(lambda m: (
-                 (_get(cogs_per_month, m) * 12) / _avg_inv(m)
-                 if _avg_inv(m) else 0.0)),
-             fmt="num1")
-
-        # 2026-09-04 (James) — suggested stock goal as a line in the
-        # Inventory section. Source: stock_goal_snapshots (one row per
-        # day, written by the Ordering page / warm job — see
-        # engine/stock_goal.py). Per month we take the LATEST snapshot
-        # in that month; months before snapshots began show "—".
-        # The gap row uses the modelled end-of-month stock value above
-        # (current month = live headline stock value, so it ties to the
-        # Command Centre "Over goal by" tile).
-        try:
-            _goal_rows_mm = db.list_stock_goal_snapshots(limit=800) or []
-        except Exception:  # noqa: BLE001
-            _goal_rows_mm = []
-        # Prefer COMPLETE rows (reorder level present = supplier lead
-        # times applied); a provisional warm-job row is only used for
-        # a month that has no complete row at all.
-        _goal_by_month: dict = {}
-        _goal_month_complete: dict = {}
-        for _gr in _goal_rows_mm:  # oldest -> newest, so last wins
-            try:
-                _gd = pd.to_datetime(_gr.get("snapshot_date"),
-                                     errors="coerce")
-                _gv = float(_gr.get("goal_value") or 0)
-                if pd.isna(_gd) or _gv <= 0:
-                    continue
-                _gm = pd.Period(_gd, freq="M")
-                _complete = float(_gr.get("reorder_level_value") or 0) > 0
-                if _complete or not _goal_month_complete.get(_gm):
-                    _goal_by_month[_gm] = _gv
-                    _goal_month_complete[_gm] = _complete
+                return fn() or default
             except Exception:  # noqa: BLE001
-                continue
+                return default
 
-        def _goal_for(m):
-            return _goal_by_month.get(m)  # None -> "—"
-
-        def _gap_vs_goal(m):
-            g = _goal_for(m)
-            if g is None:
-                return None
-            return end_of_month_inv.get(m, inv_value_now) - g
-
-        _row("4. Inventory [App]", "Stock Goal (suggested)",
-             _per_month(_goal_for))
-        _row("4. Inventory [App]", "Stock Over / (Short of) Goal",
-             _per_month(_gap_vs_goal))
-
-        # v2.67.178 — Slow-mover progress rows (management
-        # dashboard signal). Two complementary metrics:
-        #   1. "Slow Stock SOLD" — clearance per month (the
-        #      flow). Going UP = team is moving slow stock.
-        #      Computed: sale_lines for SKUs currently in the
-        #      dormancy_warnings set, qty × AverageCost,
-        #      grouped by month. Note: "currently flagged" —
-        #      historical "was-flagged-at-that-time" would be
-        #      cleaner but requires keying on
-        #      sku_dormancy_log.first_seen_dormant_at vs the
-        #      sale's date; current set is a good-enough proxy
-        #      for trend monitoring.
-        #   2. "Slow Stock Value (snapshot)" — end-of-period
-        #      level (the stock). Going DOWN = team is winning.
-        #      Read from slow_mover_value_snapshots which is
-        #      written by the engine on each recompute. May be
-        #      sparse for months before v2.67.36 (when the
-        #      writer was added). Current-month value uses the
-        #      live _compute_slow_stock_holding for accuracy.
-        try:
-            _warns_mm = db.get_dormancy_warnings() or {}
-        except Exception:
-            _warns_mm = {}
-        _slow_skus = set(_warns_mm.keys())
-        if _slow_skus and not sl_prod.empty:
-            _slow_mask = sl_prod["SKU"].astype(str).isin(
-                _slow_skus)
-            _slow_sold_per_month = (
-                (sl_prod.loc[_slow_mask, "Quantity"]
-                 * sl_prod.loc[_slow_mask, "AverageCost"])
-                .groupby(sl_prod.loc[_slow_mask, "MonthKey"])
-                .sum())
-        else:
-            _slow_sold_per_month = pd.Series(dtype=float)
-        _row("4. Inventory [App]", "Slow Stock Cleared",
-             _per_month(lambda m: _get(
-                 _slow_sold_per_month, m)))
-
-        # Slow Stock Value snapshot per month. We use the
-        # latest snapshot within each month from
-        # slow_mover_value_snapshots; for the current month we
-        # use the live helper (more accurate than the latest
-        # snapshot since the engine may not have run today).
-        try:
-            _snap_rows = db.list_slow_mover_snapshots(
-                limit=365 * 2) or []
-        except Exception:
-            _snap_rows = []
-        _snap_by_month: dict = {}
-        for _sr in _snap_rows:
-            try:
-                _sd = pd.to_datetime(
-                    _sr.get("snapshot_date"), errors="coerce")
-                if pd.isna(_sd):
-                    continue
-                _mk = pd.Period(_sd, freq="M")
-                _val = float(_sr.get("value_on_shelf") or 0)
-                # Keep the LATEST snapshot per month.
-                _prev = _snap_by_month.get(_mk)
-                if _prev is None or _val > 0:
-                    _snap_by_month[_mk] = _val
-            except Exception:
-                continue
-        # Override current month with live value if engine
-        # signals available right now.
+        _shopify_disc = _safe(db.all_shopify_monthly_discounts, {})
+        _qbo_mappings = _safe(db.get_qbo_account_mappings, {})
+        _qb_by_month = (_safe(lambda: db.qbo_monthly_pl_summary_by_category(
+            _qbo_mappings), {}) if _qbo_mappings else {})
+        _qb_anomaly_months = (_safe(lambda: db.qbo_monthly_pl_anomaly_months(
+            _qb_by_month), {}) if _qb_by_month else {})
+        _goal_rows_mm = _safe(lambda: db.list_stock_goal_snapshots(limit=800), [])
+        _warns_mm = _safe(db.get_dormancy_warnings, {})
+        _snap_rows = _safe(lambda: db.list_slow_mover_snapshots(limit=365 * 2), [])
         # NB: `engine_df` is not defined on this page (it is a local of
-        # the Ordering context) — the old reference raised NameError
-        # inside this try and the current month silently showed $0.
+        # the Ordering context) — use _get_engine_df().
         try:
-            _live_holding = _compute_slow_stock_holding(
-                _get_engine_df(), _warns_mm)
-            _snap_by_month[current_month] = float(
-                _live_holding.get("value_held") or 0)
+            _live_slow_value = float(_compute_slow_stock_holding(
+                _get_engine_df(), _warns_mm).get("value_held") or 0)
         except Exception:  # noqa: BLE001
-            pass
-        _row("4. Inventory [App]", "Slow Stock Value (EOM)",
-             _per_month(lambda m: _snap_by_month.get(m)))
+            _live_slow_value = None
 
-        # --- Render as a DataFrame -----------------------------------
-        # Build output table: metric label + one col per month label.
-        display_rows = []
-        for r in rows:
-            row = {"Section": r["Section"], "Metric": r["Metric"]}
-            for lbl, v in zip(month_labels, r["Values"]):
-                row[lbl] = v
-            display_rows.append(row)
-        table_df = pd.DataFrame(display_rows)
+        _mm = _mm_compute(MonthlyMetricsInputs(
+            sale_lines=sale_lines,
+            purchase_lines=purchase_lines,
+            shopify_orders=shopify_orders,
+            sales_headers=_load_longest_sales(),
+            inv_value_now=_headline_stock_value(stock, products),
+            shopify_discounts=_shopify_disc,
+            qb_by_month=_qb_by_month,
+            stock_goal_rows=_goal_rows_mm,
+            dormancy_warnings=_warns_mm,
+            slow_mover_snapshots=_snap_rows,
+            live_slow_stock_value=_live_slow_value,
+            channel=sel_channel,
+            lookback_months=int(lookback_months),
+        ))
+        rows = _mm.rows
+        months = _mm.months
+        month_labels = _mm.month_labels
+        current_month = _mm.current_month
+        table_df = _mm_build_table(rows, month_labels, current_month,
+                                   show_ytd=bool(show_ytd))
 
-        # YTD + Avg
-        if show_ytd:
-            ytd_year = current_month.year
-            ytd_labels = [lbl for lbl in month_labels
-                            if int(lbl.split("-")[0]) == ytd_year]
-            for idx, r in enumerate(rows):
-                # v2.67.xxx — Section 7 rows can now carry None for
-                # "no QBO sync data this month" (see _qb_per_month);
-                # exclude those from the YTD/Avg sums rather than
-                # letting None poison sum() or silently treating an
-                # un-synced month as $0 in the average.
-                ytd_vals = [v for lbl, v in zip(month_labels, r["Values"])
-                             if lbl in ytd_labels and v is not None]
-                avg_vals = [v for v in r["Values"] if v is not None]
-                if r["Format"] == "pct":
-                    # Avg of percents — weighted by the underlying totals
-                    # is the "right" way, but the simple mean is what
-                    # Easy Insight does, so match it.
-                    table_df.at[idx, "YTD"] = (
-                        sum(ytd_vals) / len(ytd_vals) if ytd_vals else 0.0)
-                    table_df.at[idx, "Avg"] = (
-                        sum(avg_vals) / len(avg_vals) if avg_vals else 0.0)
-                else:
-                    table_df.at[idx, "YTD"] = sum(ytd_vals)
-                    table_df.at[idx, "Avg"] = (
-                        sum(avg_vals) / len(avg_vals) if avg_vals else 0.0)
+        # Intermediates the charts / tooltips below reuse.
+        _get = _mm.details["get"]
+        _qb = _mm.details["qb"]
+        _discounts_for = _mm.details["discounts_for"]
+        sales_per_month = _mm.details["sales_per_month"]
+        cogs_per_month = _mm.details["cogs_per_month"]
+        _rev_by_chan_month = _mm.details["rev_by_chan_month"]
+        _goal_by_month = _mm.details["goal_by_month"]
+        end_of_month_inv = _mm.details["end_of_month_inv"]
+        _snap_by_month = _mm.details["snap_by_month"]
+        inv_value_now = _mm.details["inv_value_now"]
+        new_customers = _mm.details["new_customers"]
+        _lost_customers = _mm.details["lost_customers"]
+        _shopify_split_rev = _mm.details["shopify_split_rev"]
+        _shopify_split_cnt = _mm.details["shopify_split_cnt"]
+        _orders_by_chan_month = _mm.details["orders_by_chan_month"]
 
         # --- Format values for display ------------------------------
-        def _fmt_cell(v, fmt):
-            # No QBO sync data for this month (see _qb_per_month) —
-            # distinct from a real $0 posted to the account. Checked
-            # with pd.isna() (not `v is None`) because a None mixed
-            # into a float column becomes NaN once it round-trips
-            # through pd.DataFrame(display_rows) below — pandas
-            # silently upcasts None to NaN in an all-numeric column,
-            # so a plain `is None` check would miss it there and
-            # print a literal "nan" instead of "—".
-            try:
-                if pd.isna(v):
-                    return "—"
-            except (TypeError, ValueError):
-                pass
-            try:
-                v = float(v)
-            except (ValueError, TypeError):
-                return str(v)
-            if fmt == "money":
-                return f"${v:,.0f}"
-            if fmt == "pct":
-                return f"{v:.0f}%"
-            if fmt == "int":
-                return f"{v:,.0f}"
-            if fmt == "num1":
-                return f"{v:.1f}"
-            return f"{v:,.2f}"
-
-        # Cast numeric columns to object so we can write formatted strings
-        # into them without pandas raising a dtype-strict error.
         display_table = table_df.copy()
         _fmt_cols = list(month_labels) + (
             ["YTD", "Avg"] if show_ytd else [])
@@ -22496,17 +21644,7 @@ elif page == "Monthly Metrics":
         # page-1 sections (App data) at the top, page-2 sections
         # (canonical financials) below. Each section is tagged with
         # its source system in the header.
-        _section_order = [
-            "1. Sales Overview [App]",
-            "2. Margins & Purchasing [App]",
-            "3. Customer Metrics [App]",
-            "4. Inventory [App]",
-            "5. Revenue by Channel [Cin7/DEAR]",
-            "6. Sales & Adjustments [QuickBooks]",
-            "7. Cost & Profitability [QuickBooks]",
-            "8. Shipping Detail [QuickBooks]",
-            "9. Order Counts [Cin7/DEAR]",
-        ]
+        _section_order = list(_MM_SECTION_ORDER)
         # 2026-09-04 (James) — stock-optimisation progress chart under
         # the Inventory section: stock value vs goal, with slow and
         # dead stock as the part we are trying to shrink.
@@ -22657,59 +21795,10 @@ elif page == "Monthly Metrics":
         )
 
         # LLM-ready markdown — formatted for pasting into ChatGPT
-        llm_md_lines = [
-            "# Monthly Metrics — Wired4Signs USA",
-            f"**Channel:** {sel_channel}  "
-            f"**Months:** {month_labels[0]} to {month_labels[-1]}  "
-            f"**Generated:** {datetime.now():%Y-%m-%d %H:%M}",
-            "",
-            "Please write a business commentary based on these numbers. "
-            "Highlight: MoM trends, which channels / customer segments "
-            "are driving growth, any metric that shifted >10% vs "
-            "prior month, and flag anything that warrants a closer look. "
-            "Keep it punchy — paste-to-Slack length.",
-            "",
-        ]
-        # v2.67.299 — markdown export was iterating the old
-        # hardcoded ["Sales","Margins","Customers","Inventory"]
-        # section list, so after the v2.67.298 rename to the
-        # numbered Viktor-style sections every table came out
-        # empty in the export. Now uses the same _section_order +
-        # catch-all loop the on-page renderer uses, so the export
-        # always mirrors what's on the page.
-        _md_section_order = _section_order + [
-            s for s in (r["Section"] for r in rows)
-            if s not in _section_order]
-        _md_seen: set = set()
-        for section in _md_section_order:
-            if section in _md_seen:
-                continue
-            _md_seen.add(section)
-            sect_rows = [r for r in rows if r["Section"] == section]
-            if not sect_rows:
-                continue
-            llm_md_lines.append(f"## {section}")
-            # Table header
-            headers = ["Metric"] + list(month_labels) + (
-                ["YTD", "Avg"] if show_ytd else [])
-            llm_md_lines.append("| " + " | ".join(headers) + " |")
-            llm_md_lines.append(
-                "|" + "|".join(["---"] * len(headers)) + "|")
-            for r in sect_rows:
-                vals = [_fmt_cell(v, r["Format"]) for v in r["Values"]]
-                if show_ytd:
-                    idx = next(i for i, rr in enumerate(rows)
-                                if rr is r)
-                    vals.append(_fmt_cell(
-                        table_df.at[idx, "YTD"], r["Format"]))
-                    vals.append(_fmt_cell(
-                        table_df.at[idx, "Avg"], r["Format"]))
-                llm_md_lines.append(
-                    "| " + r["Metric"] + " | " + " | ".join(vals)
-                    + " |")
-            llm_md_lines.append("")
-
-        llm_markdown = "\n".join(llm_md_lines)
+        from engine.monthly_metrics import llm_markdown as _mm_llm_markdown
+        llm_markdown = _mm_llm_markdown(
+            rows, table_df, month_labels, sel_channel,
+            show_ytd=bool(show_ytd))
         e2.download_button(
             "🤖 LLM-ready markdown",
             data=llm_markdown,
