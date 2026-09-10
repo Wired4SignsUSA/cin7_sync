@@ -153,6 +153,18 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 
 ## Shipped (since 2026-04-30)
 
+### 2026-09-10
+
+- **Finishing Work Orders rebuilt on the 865FabLab engine** — All Star
+  powder coating / anodizing now runs the corner mechanism: planner →
+  order → AUTHORISED CIN7 assembly per finished SKU + Draft PO to All Star
+  (service SKUs × feet / end caps, memo = end product + colour + qty) →
+  on PO authorise the worker posts pick list + All Star instruction sheet
+  PDFs to #powdercoating-anodize-control → `done` replies or the app
+  complete the assemblies. No Odoo. Flow profiles live in
+  `outsource_flows.py`; `finishing_autoassembly_off.py` switches
+  AutoAssembly off for SKUs in the flow (agreed with James).
+
 ### 2026-07-03
 
 - **Ordering lead-time and minimums guardrail** — `Vendor LT` now means

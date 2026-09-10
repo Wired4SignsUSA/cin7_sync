@@ -26,13 +26,19 @@ from engine.sku_rules import parse_corner_bom_rule
 # 865FabLab per-each service SKUs (OSC-865FABLAB-JOINT, -LABOR, ...) live in
 # the BOMs so the PO/quote can charge them, but they are not materials —
 # never count them in buildable / shortfall / consumed maths.
-_SERVICE_PREFIX = "OSC-865FABLAB"
+# Since 2026-09-10 the order lifecycle / place / receiving / docs helpers
+# below take a `flow` (outsource_flows.Flow) so the Finishing Work Orders
+# page (app_pages/coating_work_orders.py) reuses them unchanged.
+from outsource_flows import FABLAB, Flow, is_any_service
+
+_SERVICE_PREFIX = FABLAB.service_prefixes[0]
 
 
 def _is_service(sku: str) -> bool:
-    return str(sku or "").strip().upper().startswith(_SERVICE_PREFIX)
+    """Vendor service line in any flow (never material)."""
+    return is_any_service(sku)
 
-FABLAB_SUPPLIER = "865FabLab"
+FABLAB_SUPPLIER = FABLAB.supplier
 FABLAB_FLAG_TYPE = "865FabLab build"
 
 
@@ -283,34 +289,42 @@ def _get_flagged_skus(bom_parents: dict | None = None) -> list[str]:
     return sorted(skus)
 
 
-def bom_service_skus(bom_parents: dict | None) -> set[str]:
-    """SKUs whose BOM includes an 865FabLab service component."""
+def bom_service_skus(bom_parents: dict | None, flow: Flow = FABLAB) -> set[str]:
+    """SKUs whose BOM includes one of the flow's vendor service components."""
     out: set[str] = set()
     for sku, comps in (bom_parents or {}).items():
-        if any(_is_service(str(c.get("ComponentSKU") or "")) for c in comps):
+        if any(flow.is_service(str(c.get("ComponentSKU") or "")) for c in comps):
             out.add(str(sku))
     return out
 
 
-def _render_order_docs(draft_id: int) -> None:
-    """Download buttons for the consolidated pick list and 2.25x1.25in
-    pack labels of a placed order (also posted to Slack by the worker)."""
+def _render_order_docs(draft_id: int, flow: Flow = FABLAB) -> None:
+    """Download buttons for the placed order's PDFs (pick list, plus pack
+    labels for corners / vendor instruction sheet for finishing). The
+    worker posts the same files to Slack when the PO is authorised."""
     try:
         import fablab_pick_pdf
-        docs = fablab_pick_pdf.build_docs(draft_id)
+        docs = fablab_pick_pdf.build_docs(draft_id, flow=flow)
     except Exception as exc:  # noqa: BLE001
-        st.caption(f"Pick list / labels unavailable: {exc}")
+        st.caption(f"Pick list / documents unavailable: {exc}")
         return
+    k = flow.key
     c1, c2, _ = st.columns([1, 1, 3])
     with c1:
         st.download_button("📋 Pick list (PDF)", data=open(docs["pick_list"], "rb").read(),
                            file_name=docs["pick_list"].name, mime="application/pdf",
-                           key=f"fablab_pick_pdf_{draft_id}")
+                           key=f"{k}_pick_pdf_{draft_id}")
     with c2:
-        st.download_button(f"🏷️ {docs['label_count']} pack labels (PDF)",
-                           data=open(docs["labels"], "rb").read(),
-                           file_name=docs["labels"].name, mime="application/pdf",
-                           key=f"fablab_labels_pdf_{draft_id}")
+        if docs.get("labels"):
+            st.download_button(f"🏷️ {docs['label_count']} pack labels (PDF)",
+                               data=open(docs["labels"], "rb").read(),
+                               file_name=docs["labels"].name, mime="application/pdf",
+                               key=f"{k}_labels_pdf_{draft_id}")
+        if docs.get("vendor_sheet"):
+            st.download_button(f"📄 {flow.short} instruction sheet (PDF)",
+                               data=open(docs["vendor_sheet"], "rb").read(),
+                               file_name=docs["vendor_sheet"].name, mime="application/pdf",
+                               key=f"{k}_vendor_pdf_{draft_id}")
 
 
 def _render_bom_setup_check(products: pd.DataFrame, bom_parents: dict) -> None:
@@ -419,20 +433,22 @@ def _render_build_list_manager(
 
 # ── Order (po_drafts) lifecycle ─────────────────────────────────────────
 
-def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
-    """865FabLab-scoped version of the Ordering page's draft lifecycle UI
-    (same po_drafts/po_draft_lines tables, fixed supplier).
+def _render_draft_lifecycle(actor: str,
+                            flow: Flow = FABLAB) -> tuple[Optional[int], bool, bool]:
+    """Vendor-scoped version of the Ordering page's draft lifecycle UI
+    (same po_drafts/po_draft_lines tables, supplier fixed by the flow).
 
     Returns (active_draft_id, can_edit, is_submitted)."""
     import db
+    k = flow.key
 
-    drafts = db.list_po_drafts(supplier=FABLAB_SUPPLIER, include_archived=False)
+    drafts = db.list_po_drafts(supplier=flow.supplier, include_archived=False)
     archived = [
-        d for d in db.list_po_drafts(supplier=FABLAB_SUPPLIER, include_archived=True)
+        d for d in db.list_po_drafts(supplier=flow.supplier, include_archived=True)
         if d["status"] in ("finalized", "cancelled")
     ]
 
-    state_key = "fablab_active_draft"
+    state_key = f"{k}_active_draft"
     active_id = st.session_state.get(state_key)
 
     opts = ["— No active order —"]
@@ -450,7 +466,7 @@ def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
         opt_to_id[label] = d["id"]
 
     st.markdown(
-        f"**\U0001f4cb 865FabLab orders** — {len(drafts)} active"
+        f"**\U0001f4cb {flow.short} orders** — {len(drafts)} active"
         + (f", {len(archived)} archived" if archived else ""))
 
     default_idx = 0
@@ -461,7 +477,7 @@ def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
                 break
     picked = st.selectbox(
         "Active order", opts, index=default_idx,
-        key="fablab_draft_picker",
+        key=f"{k}_draft_picker",
         help="Pick an existing order, or leave on 'No active order' and "
              "create one from the ticked items below the table.")
     new_id = opt_to_id.get(picked)
@@ -500,7 +516,7 @@ def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
         st.markdown(meta)
     with info_cols[1]:
         if not is_submitted and not i_hold_lock:
-            if st.button("\U0001f511 Take lock", key=f"fablab_lock_{active_id}",
+            if st.button("\U0001f511 Take lock", key=f"{k}_lock_{active_id}",
                          use_container_width=True):
                 if db.lock_po_draft(active_id, actor):
                     st.rerun()
@@ -508,7 +524,7 @@ def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
                     st.error(f"\U0001f512 {lock_holder} holds the lock.")
         elif not is_submitted and i_hold_lock:
             if st.button("\U0001f513 Release lock",
-                         key=f"fablab_release_{active_id}",
+                         key=f"{k}_release_{active_id}",
                          use_container_width=True):
                 db.release_po_draft_lock(active_id, actor)
                 st.rerun()
@@ -518,8 +534,8 @@ def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
                 st.markdown("**Cancel this order?** Cannot be undone.")
                 reason = st.text_input(
                     "Reason (optional)",
-                    key=f"fablab_cancel_reason_{active_id}")
-                if st.button("Confirm cancel", key=f"fablab_cancel_{active_id}"):
+                    key=f"{k}_cancel_reason_{active_id}")
+                if st.button("Confirm cancel", key=f"{k}_cancel_{active_id}"):
                     db.cancel_po_draft(active_id, actor, reason=reason)
                     st.session_state[state_key] = None
                     st.success("Cancelled.")
@@ -531,33 +547,38 @@ def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
 
 def _render_place_order(draft_id: int, bom_parents: dict,
                         product_map: dict, actor: str,
-                        stock_map: Optional[dict] = None) -> None:
+                        stock_map: Optional[dict] = None,
+                        flow: Flow = FABLAB) -> None:
     """Place the order: one AUTHORISED CIN7 assembly per line + one
-    labor-only Draft PO to 865FabLab (fablab_assemblies.place_order).
+    service-only Draft PO to the vendor (fablab_assemblies.place_order).
     Preview first, then explicit confirm."""
     import db
     import fablab_assemblies as fa
+    k = flow.key
 
     saved = db.get_po_draft_lines(draft_id)
     if not saved:
         return
 
-    show_key = f"fablab_place_show_{draft_id}"
-    if st.button("\U0001f680 Place order with 865FabLab",
-                 key=f"fablab_place_btn_{draft_id}", type="primary"):
+    show_key = f"{k}_place_show_{draft_id}"
+    if st.button(f"\U0001f680 Place order with {flow.short}",
+                 key=f"{k}_place_btn_{draft_id}", type="primary"):
         st.session_state[show_key] = True
     if not st.session_state.get(show_key):
         return
 
     with st.expander(f"Place order #{draft_id}?", expanded=True):
+        svc_codes = " / ".join(f"`{p}-*`" for p in flow.service_prefixes)
+        tail = ("and the Odoo lead + quote are created." if flow.odoo else
+                f"with the pick list and the {flow.short} instruction sheet.")
         st.markdown(
             "**What happens:** one CIN7 assembly (Finished Goods, "
             "*authorised*) per SKU below — CIN7 builds each pick list from "
-            "the BOM — plus one Draft PO to 865FabLab with one line per "
-            "service SKU (`OSC-865FABLAB-*`) from the BOMs. When that PO is authorised "
-            "in CIN7, each assembly is posted to the 865 corner channel "
-            "and the Odoo lead + quote are created.")
-        lines = {k: _num(v) for k, v in saved.items() if _num(v) > 0}
+            f"the BOM — plus one Draft PO to {flow.supplier} with one line per "
+            f"service SKU ({svc_codes}) from the BOMs. When that PO is authorised "
+            f"in CIN7, each assembly is posted to the {flow.short} Slack channel "
+            + tail)
+        lines = {s: _num(v) for s, v in saved.items() if _num(v) > 0}
         per_sku, totals = fa.build_pick_list(lines, bom_parents, product_map)
         total_units = sum(lines.values())
         st.dataframe(pd.DataFrame([
@@ -565,10 +586,14 @@ def _render_place_order(draft_id: int, bom_parents: dict,
              "Components (BOM)": ", ".join(
                  f"{c} × {t:g}" for c, _n, t in r["components"])}
             for r in per_sku]), use_container_width=True, hide_index=True)
-        svc_totals, _ns = fa.service_totals(lines, bom_parents)
+        svc_totals, no_svc = fa.service_totals(lines, bom_parents, flow)
         st.caption("PO lines: " + ", ".join(
-            f"{k} × {v:g}" for k, v in svc_totals.items())
-            + f" ({total_units:g} units) at the 865FabLab fixed price in CIN7.")
+            f"{s} × {v:g}" for s, v in svc_totals.items())
+            + f" ({total_units:g} units) at the {flow.supplier} price in CIN7"
+            + (" — check $0 lines on the PO before authorising." if flow is not FABLAB else "."))
+        if no_svc and not flow.fallback_service_sku:
+            st.error(f"No {flow.short} service line in the BOM for: "
+                     f"{', '.join(no_svc)} — fix in CIN7 or untick them.")
         with st.expander("PO memo / pick list preview"):
             st.code(fa.format_pick_list(
                 per_sku, totals,
@@ -577,27 +602,27 @@ def _render_place_order(draft_id: int, bom_parents: dict,
 
         confirm = st.checkbox(
             "I've checked the quantities — create the assemblies and the "
-            "labor PO now", key=f"fablab_place_confirm_{draft_id}")
+            "vendor PO now", key=f"{k}_place_confirm_{draft_id}")
         c1, c2 = st.columns([1, 1])
         with c1:
             go = st.button("Confirm — place order",
-                           key=f"fablab_place_go_{draft_id}",
+                           key=f"{k}_place_go_{draft_id}",
                            type="primary", disabled=not confirm)
         with c2:
-            if st.button("Cancel", key=f"fablab_place_cancel_{draft_id}"):
+            if st.button("Cancel", key=f"{k}_place_cancel_{draft_id}"):
                 st.session_state[show_key] = False
                 st.rerun()
         if go:
-            with st.spinner("Creating assemblies and labor PO in CIN7…"):
+            with st.spinner(f"Creating assemblies and the {flow.short} PO in CIN7…"):
                 res = fa.place_order(
                     draft_id, bom_parents, product_map, actor=actor,
-                    apply=True, stock_map=stock_map)
+                    apply=True, stock_map=stock_map, flow=flow)
             for w in res.get("warnings", []):
                 st.warning(w)
             if res.get("ok"):
                 st.success(
-                    f"Placed. Labor PO **{res['po_number']}** created in "
-                    "CIN7 (DRAFT — authorise it there to notify 865FabLab). "
+                    f"Placed. PO **{res['po_number']}** to {flow.supplier} created in "
+                    "CIN7 (DRAFT — authorise it there to notify the team in Slack). "
                     "Assemblies: "
                     + ", ".join(f"{a['assembly_number']} ({a['sku']} × "
                                 f"{_num(a['qty']):g})"
@@ -616,12 +641,14 @@ def _preview_completion(assembly_id: int, qty: float) -> dict:
                                 actor="preview", apply=False)
 
 
-def _render_assembly_receiving(draft_id: int, actor: str) -> bool:
+def _render_assembly_receiving(draft_id: int, actor: str,
+                               flow: Flow = FABLAB) -> bool:
     """Per-assembly receiving for orders placed through the assembly
     flow. Returns True if the order has assemblies (legacy fallback
     otherwise)."""
     import db
     import fablab_assemblies as fa
+    k = flow.key
 
     rows = db.list_fablab_assemblies(draft_id)
     if not rows:
@@ -648,12 +675,12 @@ def _render_assembly_receiving(draft_id: int, actor: str) -> bool:
     labels = {f"{r['assembly_number']} · {r['sku']} × {_num(r['quantity']):g}": r
               for r in open_rows}
     pick = st.selectbox("Complete an assembly", list(labels),
-                        key=f"fablab_recv_pick_{draft_id}")
+                        key=f"{k}_recv_pick_{draft_id}")
     a = labels[pick]
     qty = st.number_input(
         "Quantity received", min_value=1, max_value=int(_num(a["quantity"])),
         value=int(_num(a["quantity"])), step=1,
-        key=f"fablab_recv_qty_{a['id']}")
+        key=f"{k}_recv_qty_{a['id']}")
     preview = _preview_completion(a["id"], float(qty))
     if preview["errors"]:
         for e in preview["errors"]:
@@ -663,14 +690,14 @@ def _render_assembly_receiving(draft_id: int, actor: str) -> bool:
         {"Component": p["component"], "BOM qty": p["bom_qty"],
          "Actual used": p["actual_qty"]} for p in preview["picks"]])
     edited = st.data_editor(
-        pick_df, key=f"fablab_recv_picks_{a['id']}_{qty}",
+        pick_df, key=f"{k}_recv_picks_{a['id']}_{qty}",
         disabled=["Component", "BOM qty"], hide_index=True,
         use_container_width=True,
         column_config={"Actual used": st.column_config.NumberColumn(
             min_value=0.0, help="Set to what was really consumed "
             "(offcut used → 0).")})
     if st.button(f"✅ Complete {a['assembly_number']}",
-                 key=f"fablab_recv_go_{a['id']}", type="primary"):
+                 key=f"{k}_recv_go_{a['id']}", type="primary"):
         overrides = {row["Component"]: _num(row["Actual used"])
                      for _, row in edited.iterrows()}
         with st.spinner("Completing in CIN7…"):

@@ -14,7 +14,6 @@ import po_dispatch_reminder
 import slack_listener
 import so_lookup
 import worker_engine
-from app_pages.coating_work_orders import build_coating_work_orders
 from app_config import (
     PAGE_CAPTIONS,
     PAGE_DESCRIPTIONS,
@@ -265,125 +264,106 @@ class DemandRollupTests(unittest.TestCase):
         # Full engine path tested in the Ordering integration tests.
 
 
-class CoatingWorkOrderTests(unittest.TestCase):
-    def test_powder_coating_queue_uses_cin7_bom_service_component(self) -> None:
-        boms = pd.DataFrame([
-            {
-                "AssemblySKU": "LED-AL-PL55B-FL-1",
-                "AssemblyName": "PL55 black finished channel",
-                "ComponentSKU": "LED-AL-PL55-FL-1",
-                "ComponentName": "PL55 raw channel",
-                "Quantity": 1,
-                "BOMType": "Assembly",
-            },
-            {
-                "AssemblySKU": "LED-AL-PL55B-FL-1",
-                "AssemblyName": "PL55 black finished channel",
-                "ComponentSKU": "OSC-POWDERCOAT-BK-LRG-FT",
-                "ComponentName": "Powder coat black large per foot",
-                "Quantity": 3,
-                "BOMType": "Assembly",
-            },
-        ])
+class FinishingFlowTests(unittest.TestCase):
+    """Finishing (All Star) flow shares the 865FabLab engine — see
+    outsource_flows.py and app_pages/coating_work_orders.py."""
+
+    BOMS = {
+        "LED-AL-PL55B-FL-2": [
+            {"ComponentSKU": "LED-AL-PL55-FL-2", "Quantity": 1},
+            {"ComponentSKU": "OSC-POWDERCOAT-BK-LRG-FT", "Quantity": 7},
+        ],
+        "LED-C9020021-0609": [
+            {"ComponentSKU": "LED-C9020020-0609", "Quantity": 1},
+            {"ComponentSKU": "OSC-ANODIZING-BK-SML-FT", "Quantity": 2},
+        ],
+        "LED-AL-DPL70FL-FLAT90-B": [   # corner: JOINT + powder coat
+            {"ComponentSKU": "LED-AL-DPL70FL-0609", "Quantity": 0.5},
+            {"ComponentSKU": "OSC-865FABLAB-JOINT", "Quantity": 1},
+            {"ComponentSKU": "OSC-POWDERCOAT-BK-SML-FT", "Quantity": 1},
+        ],
+        "LED-NO-SERVICE": [{"ComponentSKU": "RAW-X", "Quantity": 1}],
+    }
+
+    def test_service_sku_vocabulary_decodes(self) -> None:
+        from outsource_flows import describe_finishing_service, parse_finishing_service
+        p = parse_finishing_service("OSC-POWDERCOAT-BK-LRG-FT")
+        self.assertEqual((p["process"], p["colour"], p["size"], p["unit"]),
+                         ("Powder coat", "Black Matt", "large profile", "ft"))
+        p = parse_finishing_service("OSC-ANODIZING-SL-EC-SML")
+        self.assertEqual((p["process"], p["colour"], p["size"], p["unit"]),
+                         ("Anodize", "Silver", "small profile", "end cap"))
+        self.assertEqual(parse_finishing_service("OSC-POWDERCOAT-WH-POST")["unit"], "post plate")
+        self.assertIsNone(parse_finishing_service("PowderCoatGen"))
+        self.assertEqual(describe_finishing_service("PowderCoatGen", "Powder Coating per foot"),
+                         "Powder Coating per foot")
+
+    def test_flow_resolution_and_service_classification(self) -> None:
+        from outsource_flows import FABLAB, FINISHING, flow_for_draft, is_any_service
+        self.assertIs(flow_for_draft({"supplier": "All Star Metal Finishers"}), FINISHING)
+        self.assertIs(flow_for_draft({"supplier": "865FabLab"}), FABLAB)
+        self.assertIs(flow_for_draft({"supplier": "Someone Else"}), FABLAB)
+        self.assertTrue(is_any_service("OSC-POWDERCOAT-BK-SML-FT"))
+        self.assertTrue(is_any_service("OSC-865FABLAB-JOINT"))
+        self.assertFalse(is_any_service("LED-AL-PL55-FL-2"))
+        self.assertTrue(FINISHING.is_service("osc-anodizing-bk-ec-lrg"))
+        self.assertFalse(FINISHING.is_service("OSC-865FABLAB-JOINT"))
+
+    def test_service_totals_are_flow_specific(self) -> None:
+        import fablab_assemblies as fa
+        from outsource_flows import FABLAB, FINISHING
+        lines = {"LED-AL-PL55B-FL-2": 10, "LED-C9020021-0609": 5,
+                 "LED-AL-DPL70FL-FLAT90-B": 4, "LED-NO-SERVICE": 1}
+        fin, no_svc = fa.service_totals(lines, self.BOMS, FINISHING)
+        self.assertEqual(fin, {"OSC-POWDERCOAT-BK-LRG-FT": 70.0,
+                               "OSC-ANODIZING-BK-SML-FT": 10.0,
+                               "OSC-POWDERCOAT-BK-SML-FT": 4.0})
+        self.assertEqual(no_svc, ["LED-NO-SERVICE"])   # no fallback for finishing
+        corner, no_svc = fa.service_totals(lines, self.BOMS, FABLAB)
+        # powder-coat lines never leak into the 865FabLab PO; JOINT fallback applies
+        self.assertEqual(corner["OSC-865FABLAB-JOINT"], 4.0 + 16.0)
+        self.assertNotIn("OSC-POWDERCOAT-BK-LRG-FT", corner)
+
+    def test_pick_list_excludes_every_service_line(self) -> None:
+        import fablab_assemblies as fa
+        per_sku, totals = fa.build_pick_list(
+            {"LED-AL-DPL70FL-FLAT90-B": 4, "LED-AL-PL55B-FL-2": 2}, self.BOMS, {})
+        self.assertEqual(totals, {"LED-AL-DPL70FL-0609": 2.0, "LED-AL-PL55-FL-2": 2.0})
+
+    def test_finishing_po_memo_names_end_product_colour_qty(self) -> None:
+        import fablab_assemblies as fa
+        memo = fa.finishing_po_memo(
+            {"LED-AL-PL55B-FL-2": 10}, self.BOMS, {"LED-AL-PL55B-FL-2": "FG-0001"},
+            header="All Star finishing — order #1 Sept black")
+        self.assertIn("[FG-0001] LED-AL-PL55B-FL-2 x10: Powder coat Black Matt 70 ft "
+                      "(raw LED-AL-PL55-FL-2 x10)", memo)
+        self.assertLessEqual(len(memo), fa.CIN7_MEMO_MAX)
+        big = fa.finishing_po_memo({f"SKU-{i:04d}": 1 for i in range(200)}, {}, None,
+                                   header="hdr")
+        self.assertLessEqual(len(big), fa.CIN7_MEMO_MAX)
+        self.assertIn("more (see assemblies)", big)
+
+    def test_finishing_page_helpers(self) -> None:
+        from app_pages.coating_work_orders import finishing_columns, legacy_finishing_skus
+        from app_pages.fablab_work_orders import bom_service_skus
+        from outsource_flows import FINISHING
+        self.assertEqual(bom_service_skus(self.BOMS, FINISHING),
+                         {"LED-AL-PL55B-FL-2", "LED-C9020021-0609", "LED-AL-DPL70FL-FLAT90-B"})
+        cols = finishing_columns("LED-AL-PL55B-FL-2", self.BOMS,
+                                 {"LED-AL-PL55B-FL-2": {"AutoAssembly": "True"}})
+        self.assertEqual(cols["Process"], "Powder coat")
+        self.assertEqual(cols["Colour"], "Black Matt")
+        self.assertEqual(cols["Raw profile"], "LED-AL-PL55-FL-2 × 1")
+        self.assertTrue(cols["Auto-assembly"])
         products = pd.DataFrame([
-            {
-                "SKU": "LED-AL-PL55B-FL-1",
-                "Name": "PL55 black finished channel",
-                "Suppliers": "Topmet",
-            },
-            {
-                "SKU": "LED-AL-PL55-FL-1",
-                "Name": "PL55 raw channel",
-            },
-            {
-                "SKU": "OSC-POWDERCOAT-BK-LRG-FT",
-                "Name": "Powder coat black large per foot",
-                "Suppliers": '[{"SupplierName": "Powder Coating Vendor"}]',
-            },
+            {"SKU": "PowderCoatGen", "Category": "Services - Powder Coating"},
+            {"SKU": "OSC-POWDERCOAT-BK-LRG-FT", "Category": "Services - Powder Coating"},
+            {"SKU": "OLD-KIT", "Category": "Fixtures - Kits"},
         ])
-        stock = pd.DataFrame([
-            {
-                "SKU": "LED-AL-PL55B-FL-1",
-                "OnHand": 2,
-                "Available": 2,
-                "OnOrder": 0,
-                "Allocated": 0,
-            },
-            {
-                "SKU": "LED-AL-PL55-FL-1",
-                "OnHand": 10,
-                "Available": 10,
-                "OnOrder": 0,
-                "Allocated": 0,
-            },
-        ])
-        engine_df = pd.DataFrame([{
-            "SKU": "LED-AL-PL55B-FL-1",
-            "Name": "PL55 black finished channel",
-            "OnHand": 2,
-            "Available": 2,
-            "OnOrder": 0,
-            "target_stock": 7,
-            "reorder_qty": 5,
-            "ABC": "A",
-            "trend_flag": "Stable",
-            "Status": "🔴 Reorder now",
-            "effective_units_12mo": 40,
-            "units_45d": 8,
-            "avg_month": 3,
-            "Supplier": "Topmet",
-        }])
-
-        result = build_coating_work_orders(
-            boms=boms,
-            products=products,
-            stock=stock,
-            engine_df=engine_df,
-            image_lookup={},
-        )
-        lines = result["lines"]
-        service_lines = result["service_lines"]
-
-        self.assertEqual(len(lines), 1)
-        row = lines.iloc[0]
-        self.assertEqual(row["Finished SKU"], "LED-AL-PL55B-FL-1")
-        self.assertEqual(row["Process"], "Powder coating")
-        self.assertEqual(row["Send qty"], 5)
-        self.assertIn("LED-AL-PL55-FL-1", row["Raw profile/part"])
-        self.assertEqual(row["Stock ready?"], "Raw available")
-        self.assertIn("Powder Coating Vendor", row["Vendor"])
-
-        self.assertEqual(len(service_lines), 1)
-        service_row = service_lines.iloc[0]
-        self.assertEqual(service_row["Service SKU"], "OSC-POWDERCOAT-BK-LRG-FT")
-        self.assertEqual(service_row["Service qty"], 15)
-        self.assertEqual(service_row["Process"], "Powder coating")
-
-    def test_anodizing_service_component_is_detected(self) -> None:
-        boms = pd.DataFrame([{
-            "AssemblySKU": "LED-AL-ANOD-1",
-            "AssemblyName": "Anodized profile",
-            "ComponentSKU": "OSC-ANODIZING-CLEAR-FT",
-            "ComponentName": "Clear anodizing per foot",
-            "Quantity": 2,
-        }])
-
-        result = build_coating_work_orders(
-            boms=boms,
-            products=pd.DataFrame(),
-            stock=pd.DataFrame(),
-            engine_df=pd.DataFrame([{
-                "SKU": "LED-AL-ANOD-1",
-                "reorder_qty": 4,
-                "target_stock": 4,
-                "Available": 0,
-                "OnOrder": 0,
-            }]),
-            image_lookup={},
-        )
-
-        self.assertEqual(result["lines"].iloc[0]["Process"], "Anodizing")
-        self.assertEqual(result["service_lines"].iloc[0]["Service qty"], 8)
+        boms = dict(self.BOMS)
+        boms["OLD-KIT"] = [{"ComponentSKU": "PowderCoatGen", "Quantity": 3}]
+        legacy = legacy_finishing_skus(products, boms)
+        self.assertEqual(legacy["Finished SKU"].tolist(), ["OLD-KIT"])
 
 
 class PageConfigTests(unittest.TestCase):

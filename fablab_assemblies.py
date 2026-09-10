@@ -32,8 +32,13 @@ CIN7 endpoints (dearinventory.apib § Finished Goods):
   POST /finishedGoods/pick       Status=COMPLETED + explicit PickLines
   DELETE /finishedGoods?ID=&Void=true
 
+Since 2026-09-10 the same engine runs the All Star finishing flow
+(powder coating / anodizing): supplier, service prefixes, Slack channel
+and Odoo on/off come from outsource_flows.Flow, picked by the order's
+supplier. Finishing skips Odoo and posts a vendor instruction sheet PDF.
+
 CLI:
-  python fablab_assemblies.py place --draft 12 [--apply]
+  python fablab_assemblies.py place --draft 12 [--apply]   (flow from the order's supplier)
   python fablab_assemblies.py check-po        (worker, every 5 min)
   python fablab_assemblies.py check-replies   (worker, every 5 min)
   python fablab_assemblies.py complete --assembly 3 [--qty 35] [--apply]
@@ -61,19 +66,26 @@ from cin7_post_finishedgoods import (
 # cin7_post_po's resolver passes IncludeSuppliers=true, which we need
 # for the 865FabLab Fixed Price on the labor SKU.
 from cin7_post_po import _resolve_products
+from outsource_flows import (FABLAB, FINISHING, FLOWS, Flow, flow_for_draft,
+                             is_any_service, describe_finishing_service)
 
 log = logging.getLogger("fablab_assemblies")
 
-FABLAB_SUPPLIER = "865FabLab"
-LABOR_SKU = "OSC-865FABLAB-JOINT"   # fallback service SKU when a BOM has none
-LABOR_PREFIX = "OSC-865FABLAB"   # any 865FabLab service SKU (e.g. -JOINT) is labor, not material
+# 2026-09-10: the engine is shared by the 865FabLab corner flow and the
+# All Star finishing flow (outsource_flows.py). Per-flow values (supplier,
+# service prefixes, channel, Odoo yes/no) come from a Flow profile; the
+# module-level names below are kept for the corner flow's callers.
+FABLAB_SUPPLIER = FABLAB.supplier
+LABOR_SKU = FABLAB.fallback_service_sku   # fallback service SKU when a corner BOM has none
+LABOR_PREFIX = FABLAB.service_prefixes[0]
+DEFAULT_LABOR_PRICE = FABLAB.default_price
+CORNER_CHANNEL_ID = FABLAB.channel_id
+FINISHING_CHANNEL_ID = FINISHING.channel_id
 
 
 def _is_labor(sku) -> bool:
-    return str(sku or "").upper().startswith(LABOR_PREFIX)
-DEFAULT_LABOR_PRICE = 15.0
-CORNER_CHANNEL_ID = os.environ.get(
-    "SLACK_FABLAB_CORNER_CHANNEL_ID", fablab_slack.FABLAB_CHANNEL_ID)
+    """Vendor service line in ANY flow → not material, never picked."""
+    return is_any_service(sku)
 
 _DONE_RE = re.compile(r"^\s*(?:done|received|complete[d]?)\b\s*(\d+(?:\.\d+)?)?",
                       re.IGNORECASE)
@@ -149,10 +161,13 @@ def _locator_of(product_map: dict, sku: str) -> str:
     return ""
 
 
-def service_totals(lines: dict, bom_parents: dict) -> tuple[dict, list]:
-    """Per-each 865FabLab service SKUs (OSC-865FABLAB-*) summed from the
-    BOMs: {service_sku: total_units}. SKUs whose BOM has no service line
-    fall back to LABOR_SKU × 1 and are returned in `no_service`."""
+def service_totals(lines: dict, bom_parents: dict,
+                   flow: Flow = FABLAB) -> tuple[dict, list]:
+    """This flow's vendor service SKUs summed from the BOMs:
+    {service_sku: total_units} (per-each for corners, feet / end caps for
+    finishing). SKUs whose BOM has no service line for this flow are
+    returned in `no_service`; when the flow has a fallback SKU (corners →
+    JOINT × 1) they are charged on it, otherwise they are left out."""
     totals: dict = {}
     no_service = []
     for sku, qty in lines.items():
@@ -161,13 +176,52 @@ def service_totals(lines: dict, bom_parents: dict) -> tuple[dict, list]:
         for comp in bom_parents.get(sku, []):
             csku = str(comp.get("ComponentSKU") or "").strip().upper()
             per = _num(comp.get("Quantity"))
-            if csku and per > 0 and _is_labor(csku):
+            if csku and per > 0 and flow.is_service(csku):
                 totals[csku] = round(totals.get(csku, 0.0) + qty * per, 3)
                 found = True
         if not found:
-            totals[LABOR_SKU] = round(totals.get(LABOR_SKU, 0.0) + qty, 3)
+            if flow.fallback_service_sku:
+                fb = flow.fallback_service_sku
+                totals[fb] = round(totals.get(fb, 0.0) + qty, 3)
             no_service.append(sku)
     return totals, no_service
+
+
+def finishing_po_memo(lines: dict, bom_parents: dict,
+                      assembly_numbers: Optional[dict], header: str) -> str:
+    """All Star PO memo (James, 2026-09-10): end product, desired colour /
+    process and qty per line, plus the raw profile being sent and the
+    service quantity (feet / end caps). Fits CIN7's 1024-char cap."""
+    rows = []
+    for sku, qty in lines.items():
+        qty = _num(qty)
+        svc_bits, raw_bits = [], []
+        for comp in bom_parents.get(sku, []) or []:
+            csku = str(comp.get("ComponentSKU") or "").strip()
+            per = _num(comp.get("Quantity"))
+            if not csku or per <= 0:
+                continue
+            if FINISHING.is_service(csku):
+                words = describe_finishing_service(csku).split(" · ")
+                unit = " ft" if csku.upper().endswith("-FT") else ""
+                svc_bits.append(f"{' '.join(words[:2])} {qty * per:g}{unit}")
+            elif not _is_labor(csku):
+                raw_bits.append(f"{csku} x{qty * per:g}")
+        tag = (f"[{assembly_numbers[sku]}] "
+               if assembly_numbers and assembly_numbers.get(sku) else "")
+        rows.append(f"{tag}{sku} x{qty:g}: "
+                    + (", ".join(svc_bits) or "finish per BOM")
+                    + (f" (raw {', '.join(raw_bits)})" if raw_bits else ""))
+    out = header
+    for i, row in enumerate(rows):
+        remaining = len(rows) - i
+        marker = f"\n+{remaining} more (see assemblies)"
+        candidate = out + "\n" + row
+        if len(candidate) + (len(marker) if remaining > 1 else 0) > CIN7_MEMO_MAX:
+            out += marker
+            break
+        out = candidate
+    return out[:CIN7_MEMO_MAX]
 
 
 def component_notes(totals: dict, bom_parents: dict, product_map: dict,
@@ -293,11 +347,13 @@ def _post_finished_goods(headers: dict, *, product_id: str, qty: float,
 def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
                 actor: str, apply: bool = False,
                 location: str = "Main Warehouse",
-                stock_map: Optional[dict] = None) -> dict:
+                stock_map: Optional[dict] = None,
+                flow: Optional[Flow] = None) -> dict:
     """Create AUTHORISED assemblies for every order line, then the
-    labor-only Draft PO. Idempotent per SKU (skips SKUs that already
-    have a live assembly on this order) and per PO (push_po_draft's own
-    guard). Returns a dict the UI renders."""
+    vendor Draft PO (service lines only). Idempotent per SKU (skips SKUs
+    that already have a live assembly on this order) and per PO
+    (push_po_draft's own guard). Flow defaults from the order's supplier
+    (outsource_flows.flow_for_draft). Returns a dict the UI renders."""
     import cin7_post_po
 
     res: dict = {"ok": False, "assemblies": [], "errors": [], "warnings": [],
@@ -306,6 +362,8 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
     if not draft:
         res["errors"].append(f"Order #{draft_id} not found.")
         return res
+    flow = flow or flow_for_draft(draft)
+    res["flow"] = flow.key
     if draft["status"] != "editing":
         res["errors"].append(
             f"Order is '{draft['status']}' — only an order still being "
@@ -323,7 +381,16 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
 
     existing = {r["sku"]: r for r in db.list_fablab_assemblies(draft_id)
                 if r["status"] in ("authorised", "completed")}
-    svc_totals, no_service = service_totals(lines, bom_parents)
+    svc_totals, no_service = service_totals(lines, bom_parents, flow)
+    if no_service and not flow.fallback_service_sku:
+        res["errors"].append(
+            f"No {flow.short} service line ({' / '.join(flow.service_prefixes)}"
+            f"-*) in the BOM for {', '.join(no_service)} — fix the BOM in "
+            "CIN7 or take the SKU off the order.")
+        return res
+    if not svc_totals:
+        res["errors"].append("Nothing to charge the vendor for — no service lines.")
+        return res
     resolved, last_call = _resolve_products(
         list(lines) + list(svc_totals), headers, log=log)
     missing = [s for s in lines if s not in resolved]
@@ -332,41 +399,55 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
         return res
     # A BOM line may name a service SKU that no longer exists in CIN7
     # (e.g. the cached BOM CSV still says -LABOR after the rename to
-    # -JOINT). Fold it into LABOR_SKU instead of failing the order.
+    # -JOINT). Fold it into the flow's fallback SKU instead of failing.
     missing_svc = [s for s in svc_totals if s not in resolved]
     if missing_svc:
-        for s_old in missing_svc:
-            svc_totals[LABOR_SKU] = round(
-                svc_totals.get(LABOR_SKU, 0.0) + svc_totals.pop(s_old), 3)
-        if LABOR_SKU not in resolved:
-            more, last_call = _resolve_products([LABOR_SKU], headers, log=log,
-                                                last_call=last_call)
-            resolved.update(more)
-        if LABOR_SKU not in resolved:
+        fb = flow.fallback_service_sku
+        if not fb:
             res["errors"].append(
                 f"Service SKU not found in CIN7: {', '.join(missing_svc)} "
-                f"(and fallback {LABOR_SKU} missing too)")
+                "(stale BOM cache? re-sync BOMs or fix the BOM).")
+            return res
+        for s_old in missing_svc:
+            svc_totals[fb] = round(svc_totals.get(fb, 0.0) + svc_totals.pop(s_old), 3)
+        if fb not in resolved:
+            more, last_call = _resolve_products([fb], headers, log=log,
+                                                last_call=last_call)
+            resolved.update(more)
+        if fb not in resolved:
+            res["errors"].append(
+                f"Service SKU not found in CIN7: {', '.join(missing_svc)} "
+                f"(and fallback {fb} missing too)")
             return res
         res["warnings"].append(
             f"BOM service SKU {', '.join(missing_svc)} not in CIN7 (stale "
-            f"BOM cache?) — charged as {LABOR_SKU} instead.")
-    if no_service:
+            f"BOM cache?) — charged as {fb} instead.")
+    if no_service and flow.fallback_service_sku:
         res["warnings"].append(
-            f"No 865FabLab service line in BOM for {', '.join(no_service)}; "
-            f"charged as {LABOR_SKU} × 1 each.")
+            f"No {flow.short} service line in BOM for {', '.join(no_service)}; "
+            f"charged as {flow.fallback_service_sku} × 1 each.")
 
-    # Service prices: 865FabLab Fixed Price on each service SKU.
+    # Service prices: the vendor's Fixed Price on each service SKU
+    # (IncludeSuppliers=true). Finishing rates vary by batch (James,
+    # 2026-09-10) so fall back to the supplier Cost, then average cost,
+    # and flag $0 lines — the buyer edits the price in CIN7 before
+    # authorising the PO.
     svc_price: dict = {}
     for ssku in svc_totals:
         price = None
         for sp in resolved[ssku].get("Suppliers") or []:
-            if str(sp.get("SupplierName") or "").lower() == FABLAB_SUPPLIER.lower():
+            if str(sp.get("SupplierName") or "").lower() == flow.supplier.lower():
                 price = (_num(sp.get("FixedCost")) or _num(sp.get("FixedPrice"))
                          or _num(sp.get("Cost")) or None)
-        if price is None:
+        if price is None and flow is FABLAB:
             price = _num(db.fablab_setting_get("labor_unit_price")) or DEFAULT_LABOR_PRICE
             res["warnings"].append(
                 f"No 865FabLab Fixed Price on {ssku}; using ${price:.2f}.")
+        elif price is None:
+            price = _num(resolved[ssku].get("AverageCost")) or (flow.default_price or 0.0)
+            res["warnings"].append(
+                f"No {flow.supplier} price on {ssku} in CIN7 — PO line set to "
+                f"${price:.2f}. Edit the price on the PO before authorising.")
         svc_price[ssku] = price
 
     # ---- assemblies
@@ -387,7 +468,7 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
         body, resp, last_call = _post_finished_goods(
             headers, product_id=resolved[sku]["ID"], qty=qty,
             status="AUTHORISED",
-            notes=f"865FabLab order #{draft_id} — {draft['name']}",
+            notes=f"{flow.label} — order #{draft_id} — {draft['name']}",
             location=location, log_=log, last_call=last_call)
         if resp is None or resp.status_code != 200:
             err = (f"{sku}: assembly POST failed "
@@ -417,23 +498,30 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
 
     if res["errors"]:
         res["warnings"].append(
-            "Some assemblies failed — labor PO NOT raised. Fix and place "
+            "Some assemblies failed — vendor PO NOT raised. Fix and place "
             "again; existing assemblies are reused.")
         return res
 
-    # ---- labor PO
+    # ---- vendor PO (service lines only)
     total_units = sum(lines.values())
     per_sku, totals = build_pick_list(lines, bom_parents, product_map)
     memo = format_pick_list(
         per_sku, totals, assembly_numbers,
         notes=component_notes(totals, bom_parents, product_map, stock_map),
-        header=(f"865FabLab corner assembly — order #{draft_id} "
+        header=(f"{flow.label} — order #{draft_id} "
                 f"{draft['name']} — {total_units:g} units. "
                 f"Assemblies are AUTHORISED in CIN7 (pick lists there)."))
     res["memo"] = memo
-    po_memo = compact_po_memo(
-        lines, assembly_numbers, total_units,
-        header=f"865FabLab corner assembly — order #{draft_id} {draft['name']}")
+    po_header = f"{flow.label} — order #{draft_id} {draft['name']}"
+    if flow is FINISHING:
+        po_memo = finishing_po_memo(
+            lines, bom_parents, assembly_numbers,
+            header=(f"{po_header} — {total_units:g} pieces. Colour / "
+                    "process / qty per end product below; raw profiles "
+                    "supplied by W4S."))
+    else:
+        po_memo = compact_po_memo(lines, assembly_numbers, total_units,
+                                  header=po_header)
     po_lines = []
     for ssku, sq in svc_totals.items():
         prod, price = resolved[ssku], svc_price[ssku]
@@ -446,10 +534,11 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
         draft_id, actor=actor, apply=apply, require_mov=False,
         default_location=location, lines_override=po_lines, memo=po_memo)
     res["po_lines"] = po_lines
+    res["po_memo"] = po_memo
     res["labor_price"] = svc_price.get(LABOR_SKU) or next(iter(svc_price.values()), None)
     res["warnings"].extend(push.warnings)
     if not push.ok:
-        res["errors"].extend(push.errors or ["Labor PO push failed."])
+        res["errors"].extend(push.errors or ["Vendor PO push failed."])
         return res
     res["po_number"] = push.cin7_po_number
     res["po_id"] = push.cin7_po_id
@@ -518,18 +607,38 @@ def _picker_maps() -> tuple[dict, dict, dict]:
         return {}, {}, {}
 
 
+def _service_lines_text(task: dict, flow: Flow) -> str:
+    """Finishing: 'Powder coat · Black Matt · large profile — 70 ft' from
+    the task's service OrderLines (what All Star is being asked to do)."""
+    bits = []
+    for ol in task.get("OrderLines") or []:
+        code = str(ol.get("ProductCode") or "")
+        if flow.is_service(code):
+            tot = _num(ol.get("TotalQuantity")) or _num(ol.get("Quantity"))
+            unit = " ft" if code.upper().endswith("-FT") else ""
+            bits.append(f"{describe_finishing_service(code, ol.get('Name') or '')}"
+                        f" — *{tot:g}{unit}*")
+    return "\n".join(f"• {b}" for b in bits)
+
+
 def _assembly_message(a, task: dict, po_number: str,
-                      maps: Optional[tuple] = None) -> str:
+                      maps: Optional[tuple] = None,
+                      flow: Flow = FABLAB) -> str:
     comps = _task_components(task)
     product_map, stock_map, bom_parents = maps or ({}, {}, {})
     notes = component_notes({c[0]: c[3] for c in comps}, bom_parents,
                             product_map, stock_map)
+    icon = ":art:" if flow is FINISHING else ":hammer_and_wrench:"
     lines = [
-        f":hammer_and_wrench: *{a['assembly_number']}* · `{a['sku']}` × "
+        f"{icon} *{a['assembly_number']}* · `{a['sku']}` × "
         f"*{_num(a['quantity']):g}* — {task.get('ProductName') or ''}",
-        f"Order #{a['draft_id']} · labor PO {po_number} · status AUTHORISED",
-        "*Pick list (BOM):*",
+        f"Order #{a['draft_id']} · {flow.short} PO {po_number} · status AUTHORISED",
     ]
+    if flow is FINISHING:
+        svc = _service_lines_text(task, flow)
+        if svc:
+            lines.append(f"*{flow.short} does:*\n{svc}")
+    lines.append("*Pick list (BOM) — send to " + flow.short + ":*")
     for code, name, _per, total, _pid in comps:
         qty = _ceil_qty(total)
         if qty != f"{total:g}":
@@ -538,10 +647,15 @@ def _assembly_message(a, task: dict, po_number: str,
         if notes.get(code):
             line += f"\n      ↳ _{notes[code]}_"
         lines.append(line)
-    lines.append(
-        "_When the batch is back, reply here `done` (or `done 35` for a "
-        "partial). Used less material than the BOM? Add lines like "
-        "`LED-G2000820-0609 = 0`._")
+    if flow is FINISHING:
+        lines.append(
+            "_When the finished stock is back from All Star and on the shelf, "
+            "reply here `done` (or `done 35` for a partial)._")
+    else:
+        lines.append(
+            "_When the batch is back, reply here `done` (or `done 35` for a "
+            "partial). Used less material than the BOM? Add lines like "
+            "`LED-G2000820-0609 = 0`._")
     return "\n".join(lines)
 
 
@@ -573,33 +687,41 @@ def _handle_voided(d, note, assemblies, headers, last_call, stats):
     if note and note["slack_ts"]:
         fablab_slack.post(
             f":no_entry_sign: {po_number} was voided in CIN7 — assemblies "
-            f"{', '.join(voided) or 'none'} voided; Odoo quote cancelled.",
-            channel_id=CORNER_CHANNEL_ID, thread_ts=note["slack_ts"])
+            f"{', '.join(voided) or 'none'} voided"
+            + ("; Odoo quote cancelled." if note["odoo_quote_id"] else "."),
+            channel_id=note["slack_channel"] or flow_for_draft(d).channel_id,
+            thread_ts=note["slack_ts"])
     stats["voided"] = stats.get("voided", 0) + 1
     log.info("order #%s %s voided → %s", d["id"], po_number, voided)
     return last_call
 
 
-def check_po_authorised(apply: bool = True) -> dict:
-    """Worker poll: for placed 865FabLab orders whose labor PO has left
-    DRAFT in CIN7, post per-assembly Slack messages + Odoo lead/quote
-    once (fablab_po_notifications)."""
+def check_po_authorised(apply: bool = True,
+                        flows: Optional[list] = None) -> dict:
+    """Worker poll: for placed orders (all flows) whose vendor PO has left
+    DRAFT in CIN7, post per-assembly Slack messages to the flow's channel,
+    upload the docs, and (corner flow) raise the Odoo lead/quote — once
+    per order (fablab_po_notifications)."""
     stats = {"checked": 0, "notified": 0, "errors": []}
     headers = _headers()
     if not headers:
         return stats
-    drafts = [d for d in db.list_po_drafts(supplier=FABLAB_SUPPLIER,
-                                           include_archived=True)
-              if d["status"] in ("submitted", "finalized") and d["cin7_po_id"]]
+    drafts = []
+    for flow in (flows or list(FLOWS.values())):
+        drafts += [d for d in db.list_po_drafts(supplier=flow.supplier,
+                                                include_archived=True)
+                   if d["status"] in ("submitted", "finalized") and d["cin7_po_id"]]
     last_call = 0.0
     maps = None  # picker maps loaded lazily on first notification
     for d in drafts:
+        flow = flow_for_draft(d)
+        channel = flow.channel_id
         note = db.fablab_po_notification_get(d["id"])
         assemblies = db.list_fablab_assemblies(d["id"], status="authorised")
         if note:
             # Slack already announced; retry only a failed Odoo step
             # (e.g. transient API error) so the lead/quote is not lost.
-            if (apply and note["slack_ts"] and not note["odoo_lead_id"]
+            if (flow.odoo and apply and note["slack_ts"] and not note["odoo_lead_id"]
                     and note["odoo_error"]
                     and note["odoo_error"] != "PO voided"
                     and _odoo_configured()):
@@ -653,12 +775,22 @@ def check_po_authorised(apply: bool = True) -> dict:
 
         # Header message, then one message per assembly (its own thread).
         total = sum(_num(a["quantity"]) for a in assemblies)
-        header = (f":factory: *865FabLab corner order #{d['id']} — "
-                  f"{d['name']}* · labor PO *{po_number}* authorised · "
-                  f"{total:g} units across {len(assemblies)} assembl"
-                  f"{'y' if len(assemblies) == 1 else 'ies'}. One message "
-                  "per assembly follows — talk about each in its thread.")
-        hts, err = fablab_slack.post(header, channel_id=CORNER_CHANNEL_ID)
+        plural = 'y' if len(assemblies) == 1 else 'ies'
+        if flow is FINISHING:
+            header = (f":art: *{flow.label} — order #{d['id']} — "
+                      f"{d['name']}* · PO *{po_number}* authorised · "
+                      f"{total:g} pieces across {len(assemblies)} assembl{plural}. "
+                      "Stores: pick the raw profiles below (pick list PDF "
+                      "follows), pack with the All Star instruction sheet + PO, "
+                      "and reply `done` in each assembly's thread when the "
+                      "finished stock is back on the shelf.")
+        else:
+            header = (f":factory: *865FabLab corner order #{d['id']} — "
+                      f"{d['name']}* · labor PO *{po_number}* authorised · "
+                      f"{total:g} units across {len(assemblies)} assembl{plural}. "
+                      "One message per assembly follows — talk about each in "
+                      "its thread.")
+        hts, err = fablab_slack.post(header, channel_id=channel)
         if err:
             stats["errors"].append(f"Slack header failed: {err}")
             continue
@@ -669,28 +801,32 @@ def check_po_authorised(apply: bool = True) -> dict:
                             "Quantity": a["quantity"]}
             if maps is None:
                 maps = _picker_maps()
-            ts, err = fablab_slack.post(_assembly_message(a, task, po_number, maps),
-                                        channel_id=CORNER_CHANNEL_ID)
+            ts, err = fablab_slack.post(
+                _assembly_message(a, task, po_number, maps, flow=flow),
+                channel_id=channel)
             if ts:
-                db.set_fablab_assembly_slack(a["id"], CORNER_CHANNEL_ID, ts)
+                db.set_fablab_assembly_slack(a["id"], channel, ts)
             else:
                 stats["errors"].append(
                     f"Slack post failed for {a['assembly_number']}: {err}")
             desc_lines.extend(_odoo_desc_lines(a, task))
         db.fablab_po_notification_upsert(
             d["id"], cin7_po_number=po_number,
-            slack_channel=CORNER_CHANNEL_ID, slack_ts=hts)
+            slack_channel=channel, slack_ts=hts)
         stats["notified"] += 1
-        # Consolidated pick list + pack labels (James, 2026-09-08).
+        # Documents: pick list (+ pack labels / vendor sheet per flow).
         try:
             import fablab_pick_pdf
-            docs = fablab_pick_pdf.post_docs(d["id"], channel_id=CORNER_CHANNEL_ID)
+            docs = fablab_pick_pdf.post_docs(d["id"], channel_id=channel, flow=flow)
             for e in docs.get("errors") or []:
                 stats["errors"].append(f"docs {po_number}: {e}")
         except Exception as exc:  # noqa: BLE001
             stats["errors"].append(f"docs {po_number}: {exc}")
 
-        _odoo_step(d, po_number, total, desc_lines, order, hts, apply=True)
+        if flow.odoo:
+            _odoo_step(d, po_number, total, desc_lines, order, hts, apply=True)
+        else:
+            db.fablab_po_notification_upsert(d["id"], odoo_error=None)
     return stats
 
 
@@ -749,13 +885,13 @@ def _odoo_step(d, po_number, total, desc_lines, order, hts, *, apply):
         fablab_slack.post(
             f":white_check_mark: Odoo: lead + quote *{info['quote_name']}* "
             f"created for {po_number}.",
-            channel_id=CORNER_CHANNEL_ID, thread_ts=hts)
+            channel_id=flow_for_draft(d).channel_id, thread_ts=hts)
     except Exception as exc:  # noqa: BLE001
         log.exception("Odoo step failed for order #%s", d["id"])
         db.fablab_po_notification_upsert(d["id"], odoo_error=str(exc)[:500])
         fablab_slack.post(
             f":warning: Odoo lead/quote for {po_number} failed: "
-            f"{str(exc)[:300]}", channel_id=CORNER_CHANNEL_ID,
+            f"{str(exc)[:300]}", channel_id=flow_for_draft(d).channel_id,
             thread_ts=hts)
 
 
@@ -922,8 +1058,8 @@ def complete_assembly(assembly_id: int, *, qty_received: Optional[float] = None,
         rbody, rresp, last_call = _post_finished_goods(
             headers, product_id=task.get("ProductID"), qty=remainder,
             status="AUTHORISED",
-            notes=f"865FabLab order #{a['draft_id']} — remainder of "
-                  f"{a['assembly_number']}",
+            notes=f"{flow_for_draft(db.get_po_draft(a['draft_id'])).label} "
+                  f"— order #{a['draft_id']} — remainder of {a['assembly_number']}",
             location=task.get("Location") or "Main Warehouse", log_=log,
             last_call=last_call)
         if rresp is not None and rresp.status_code == 200:
@@ -947,13 +1083,14 @@ def _announce_remainder(rem: dict, parent, headers, po_number: str) -> None:
     a = db.get_fablab_assembly(rem["id"])
     task, _ = _get_task(headers, a["cin7_task_id"])
     task = task or {"ProductName": "", "OrderLines": [], "Quantity": a["quantity"]}
+    flow = flow_for_draft(db.get_po_draft(a["draft_id"]))
+    channel = parent["slack_channel"] or flow.channel_id
     ts, _err = fablab_slack.post(
-        _assembly_message(a, task, po_number)
+        _assembly_message(a, task, po_number, flow=flow)
         + f"\n_(remainder of {parent['assembly_number']})_",
-        channel_id=parent["slack_channel"] or CORNER_CHANNEL_ID)
+        channel_id=channel)
     if ts:
-        db.set_fablab_assembly_slack(a["id"], parent["slack_channel"]
-                                     or CORNER_CHANNEL_ID, ts)
+        db.set_fablab_assembly_slack(a["id"], channel, ts)
 
 
 def check_replies(apply: bool = True) -> dict:
