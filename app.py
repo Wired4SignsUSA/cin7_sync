@@ -47,7 +47,7 @@ from app_config import (
     PAGE_OPTIONS,
 )
 from app_pages.data_health import render_data_health
-from app_pages.coating_work_orders import render_anodizing_powder_coating
+from app_pages.coating_work_orders import render_finishing_work_orders
 from app_pages.fablab_work_orders import render_fablab_work_orders
 from app_pages.my_profile import render_my_profile
 from app_pages.ordering_layout import ORDERING_PO_EDITOR_VIEW
@@ -26886,16 +26886,14 @@ elif page == "AI Assistant":
 # ---------------------------------------------------------------------------
 
 elif page in ("Finishing Work Orders", "Anodizing & Powder coating"):
-    render_anodizing_powder_coating(
-        boms=boms,
+    # 2026-09-10: rebuilt on the 865FabLab engine (All Star finishing flow).
+    render_finishing_work_orders(
         products=products,
         stock=stock,
         engine_df=_get_engine_df(),
-        product_images=product_images,
-        product_image_lookup=_product_image_lookup,
+        bom_parents=BOM_PARENTS,
         fmt_number=_fmt_number,
         fmt_money=_fmt_money,
-        rows_selector=rows_selector,
     )
 
 

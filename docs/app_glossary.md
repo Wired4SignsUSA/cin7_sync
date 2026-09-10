@@ -193,29 +193,28 @@ picker does not save or rewrite column preferences; final qty, freight,
 notes, dropship/exclude, and SKU buying-policy edits are still made in
 the main PO editor or Product Detail.
 
-#### Finishing Work Orders queue
-The Buying page **Finishing Work Orders** is driven by CIN7 BOM
-structure. A finished SKU appears only when its BOM contains a service
-component whose SKU/name looks like powder coating or anodizing, for
-example `OSC-POWDERCOAT-BK-LRG-FT`. The page does not infer these
-relationships from finished SKU names.
+#### Finishing Work Orders (All Star powder coating / anodizing)
+Since 2026-09-10 the Buying page **Finishing Work Orders** runs on the
+same engine as 865FabLab Production (`fablab_assemblies.py`, profiles in
+`outsource_flows.py`). A finished SKU is a candidate when its CIN7 BOM
+carries an All Star service line (`OSC-POWDERCOAT-*` / `OSC-ANODIZING-*`);
+legacy service SKUs (PowderCoatGen, ANODIZE-SMOKIES*, …) are listed in the
+folded setup notes until the BOM is moved over. Suggested batch = weeks of
+cover (default 8) × monthly demand − on hand − WIP, whole units.
 
-The suggested send quantity comes from the finished SKU's current
-replenishment position: engine reorder qty first, otherwise target stock
-minus available plus on-order. The page also lists the non-service raw
-components in the same BOM, the raw quantity needed, raw available
-stock, and a service-SKU summary so buyers can place the outside-service
-order and warehouse can complete the CIN7 assembly/removal-assembly
-workflow.
-
-**Workflow (v2.67.370+):** the page is process-first (All / Powder
-coating / Anodizing filter). Buyers tick finished SKUs to action, edit
-send quantities, and the **PO Comment** field is pre-built with the
-finished SKU name and quantity — paste it into the CIN7 service PO line
-so the vendor and warehouse know what each batch produces. Column layout
-is saved per-user (same drag-to-reorder editor as Ordering). SKUs can be
-excluded from the queue and reinstated via the archived panel at the
-bottom (uses the same do-not-reorder flag table as the Ordering page).
+**Flow:** tick → create/save the order (po_drafts, supplier "All Star Metal
+Finishers") → *Place order* creates one AUTHORISED CIN7 Finished Goods task
+per SKU (raw profile reserved, pick list on the task) plus one Draft PO to
+All Star with the service SKUs × feet / end caps at the All Star Fixed Cost
+in CIN7 ($0 lines are flagged — edit the PO price before authorising). PO
+memo = end product, colour/process, qty, raw profile. When the buyer
+authorises the PO in CIN7 the worker posts each assembly to
+#powdercoating-anodize-control with the pick-list PDF and the All Star
+instruction sheet PDF (colour / process groups). Stores reply `done` (or
+`done 35`) in the assembly's thread — or complete it in the Receiving
+section — and CIN7 completes the assembly: finished stock in, raw profile
+and service line consumed. No Odoo step. AutoAssembly should be OFF on SKUs
+in this flow (`finishing_autoassembly_off.py`, dry-run by default).
 
 #### Status badges
 Status is the buyer action label and uses **Available** (OnHand -
