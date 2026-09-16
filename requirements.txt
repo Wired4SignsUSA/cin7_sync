@@ -46,3 +46,8 @@ psycopg[binary]==3.3.5
 # charts (both the live dashboard and monthly_metrics_report.py's
 # PDF). Headless (Agg backend), no system binaries needed.
 matplotlib==3.11.1
+
+# 2026-09-16 — Inngest SDK (+ Connect extra: websockets/protobuf/psutil).
+# inngest_worker.py runs the Slack worker's scheduled jobs as Inngest
+# cron functions over an outbound Connect session. See INNGEST.md.
+inngest[connect]==0.5.19
