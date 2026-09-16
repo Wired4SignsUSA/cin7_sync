@@ -64,6 +64,35 @@ if [ ! -f "$_BF_MARKER" ]; then
     ) &
 fi
 
+# 2026-09-16 — one-time 90-day sale-lines backfill + corrected
+# Monthly Metrics re-issue. Why: the Aug-2026 PDF (posted on the 15th)
+# was ~200 orders / ~$60K light. The 730d sale_lines backfill was last
+# refreshed 2026-07-21 and the rolling 30d files only reached back to
+# ~Aug 17, so invoices dated Aug 1-16 were on nobody's disk. The
+# report reads whatever sale_lines_last_*d files exist and said
+# nothing. Sequence: backfill -> publish to the shared DB mirror (so
+# the worker pulls identical bytes; James: app and worker must always
+# match) -> re-post the August report with a correction note. Marker-
+# gated on the persistent disk so later deploys skip it. ~3-4h at the
+# 2.5s/call CIN7 rate; runs in the background.
+_SL_MARKER="${DATA_DIR:-/data}/.salelines_backfill_90d_2026-09"
+_SL_LOG="${DATA_DIR:-/data}/output/salelines_backfill.log"
+if [ ! -f "$_SL_MARKER" ]; then
+    (
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting 90d sale-lines backfill" >> "$_SL_LOG"
+        if python cin7_sync.py salelines --days 90 >> "$_SL_LOG" 2>&1; then
+            touch "$_SL_MARKER"
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] backfill done; marker written" >> "$_SL_LOG"
+            python dataset_mirror.py publish >> "$_SL_LOG" 2>&1 || \
+                echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] dataset_mirror publish FAILED" >> "$_SL_LOG"
+            python monthly_metrics_report.py --note ":rotating_light: *Corrected re-issue of the August 2026 report.* The version posted on the 15th was understated (about 200 orders / \$60K of sales) because the app's sale-lines files did not cover Aug 1-16 2026 after a stale backfill. That gap has been backfilled from CIN7 and the figures below supersede the earlier post. The report now also warns automatically if a coverage gap exists." >> "$_SL_LOG" 2>&1 || \
+                echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] corrected monthly report FAILED" >> "$_SL_LOG"
+        else
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] backfill FAILED (will retry next deploy)" >> "$_SL_LOG"
+        fi
+    ) &
+fi
+
 # v2.67.237 — supervise the sync loops. They are infinite while-
 # loops and should never exit on their own, but if one ever does
 # (crash, wedge cleared, OOM kill) it would otherwise stay dead

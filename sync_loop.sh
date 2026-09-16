@@ -238,6 +238,26 @@ while true; do
     if [ -f "$monthly_report_marker" ]; then
         last_monthly_report_month="$(cat "$monthly_report_marker" 2>/dev/null)"
     fi
+    # 2026-09-16 — two days before the monthly PDF, refresh a 60-day
+    # sale-lines window so the closed month is fully on disk. The
+    # nightly 30d window alone leaves the first half of the prior
+    # month uncovered by the 15th (that is how the Aug-2026 report
+    # went out ~200 orders light). Once per month, marker-gated.
+    salelines_marker="/data/.last_salelines_60d_month"
+    last_salelines_month=""
+    if [ -f "$salelines_marker" ]; then
+        last_salelines_month="$(cat "$salelines_marker" 2>/dev/null)"
+    fi
+    if [ "$day_of_month" -ge 13 ] && [ "$day_of_month" -le 14 ] \
+            && [ "$this_month" != "$last_salelines_month" ]; then
+        echo "$this_month" > "$salelines_marker"
+        echo "[$(stamp)] day $day_of_month — 60d sale-lines refresh ahead of monthly report" | tee -a "$LOG"
+        python cin7_sync.py salelines --days 60 2>&1 | tee -a "$LOG" || \
+          echo "[$(stamp)] salelines --days 60 exited non-zero" | tee -a "$LOG"
+        python dataset_mirror.py publish 2>&1 | tee -a "$LOG" || \
+          echo "[$(stamp)] dataset_mirror publish exited non-zero" | tee -a "$LOG"
+    fi
+
     if [ "$day_of_month" -eq 15 ] \
             && [ "$this_month" != "$last_monthly_report_month" ]; then
         echo "$this_month" > "$monthly_report_marker"

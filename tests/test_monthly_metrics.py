@@ -127,3 +127,30 @@ def test_table_ytd_avg_and_markdown_roundtrip():
     assert list(exp.columns[:3]) == ["Section", "Metric", "Format"]
     assert mm.fmt_cell(None, "money") == "—"
     assert mm.fmt_cell(1234.6, "money") == "$1,235"
+
+
+def test_sale_lines_coverage_gap_detects_uncovered_days():
+    """Regression for the Aug-2026 report that went out ~200 orders
+    light: a stale long-window file plus a short rolling file must
+    produce a gap warning; a fresh long window must not."""
+    from datetime import date, datetime, timedelta
+    import monthly_metrics_report as r
+
+    today = date.today()
+    # Closed month = previous month.
+    first_this = today.replace(day=1)
+    last_prev = first_this - timedelta(days=1)
+    month = last_prev.strftime("%Y-%m")
+    ts = lambda d: datetime(d.year, d.month, d.day, 12).timestamp()  # noqa: E731
+
+    # Long file last refreshed before the closed month started; 30d
+    # rolling file refreshed today -> everything before today-30d in
+    # the closed month is uncovered.
+    stale_long = ts(last_prev.replace(day=1) - timedelta(days=10))
+    wins = [(730, stale_long), (30, ts(today))]
+    gap = r.sale_lines_coverage_gap(month, wins)
+    if last_prev.replace(day=1) < today - timedelta(days=30):
+        assert gap is not None and "UNDERSTATED" in gap
+    # Fresh 90d refresh covers the whole closed month -> no warning.
+    wins.append((90, ts(today)))
+    assert r.sale_lines_coverage_gap(month, wins) is None

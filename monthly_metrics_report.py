@@ -138,6 +138,54 @@ def _load_cin7_data() -> Dict[str, Any]:
     }
 
 
+# (window_days, file_mtime) of every sale_lines file the last
+# _load_longest_sale_lines call unioned. Each file holds sales
+# *updated* within [mtime - days, mtime], which is a superset of the
+# sales *invoiced* in that range.
+_SALE_LINES_WINDOWS: List[Tuple[int, float]] = []
+
+
+def sale_lines_coverage_gap(month: str,
+                            windows: Optional[List[Tuple[int, float]]] = None
+                            ) -> Optional[str]:
+    """Return a plain-English warning when some days of `month`
+    (YYYY-MM) fall outside every sale_lines window on disk, else None.
+    Approximation: a day is covered if any file's [mtime - days, mtime]
+    range includes it."""
+    import calendar
+    from datetime import timedelta
+
+    wins = _SALE_LINES_WINDOWS if windows is None else windows
+    if not wins:
+        return None
+    try:
+        y, m = int(month[:4]), int(month[5:7])
+    except (TypeError, ValueError):
+        return None
+    ranges = []
+    for days, mtime in wins:
+        end = datetime.fromtimestamp(mtime).date()
+        ranges.append((end - timedelta(days=int(days)), end))
+    today = date.today()
+    uncovered = []
+    for d in range(1, calendar.monthrange(y, m)[1] + 1):
+        day = date(y, m, d)
+        if day > today:
+            break
+        if not any(lo <= day <= hi for lo, hi in ranges):
+            uncovered.append(day)
+    if not uncovered:
+        return None
+    first, last = uncovered[0], uncovered[-1]
+    span = (f"{first.isoformat()}" if first == last
+            else f"{first.isoformat()} to {last.isoformat()}")
+    return (f"Data coverage gap: no sale-lines file on disk covers "
+            f"{span} ({len(uncovered)} day(s)). Sales, GP and order "
+            f"counts for {month} are likely UNDERSTATED. Fix: run "
+            f"`python cin7_sync.py salelines --days 90` on the "
+            f"dashboard service and re-issue the report.")
+
+
 def _load_longest_sale_lines(output_dir, pd, filter_excluded_sales_customers):
     """Union of the largest sale_lines_last_Nd_*.csv backfill window
     plus any more-recently-synced smaller windows — same pattern as
@@ -162,6 +210,14 @@ def _load_longest_sale_lines(output_dir, pd, filter_excluded_sales_customers):
     files.sort(key=lambda x: (-x[0], -x[1]))
     base_file = files[0][2]
     base_mtime = files[0][1]
+    # Record which windows were actually unioned so the report can
+    # warn about invoice dates no file on disk covers (see
+    # sale_lines_coverage_gap). 2026-09-16: the Aug-2026 report went
+    # out ~200 orders / ~$60K light because the 730d backfill was last
+    # refreshed 2026-07-21 and the rolling 30d files only reached back
+    # to ~Aug 17 — nothing on disk held Aug 1-16, and nothing said so.
+    _SALE_LINES_WINDOWS.clear()
+    _SALE_LINES_WINDOWS.append((files[0][0], base_mtime))
     try:
         base = pd.read_csv(base_file, low_memory=False)
     except Exception:  # noqa: BLE001
@@ -176,6 +232,7 @@ def _load_longest_sale_lines(output_dir, pd, filter_excluded_sales_customers):
             continue
         if more.empty:
             continue
+        _SALE_LINES_WINDOWS.append((_days, mtime))
         base = pd.concat([base, more], ignore_index=True)
 
     dedupe_cols = [c for c in
@@ -214,6 +271,14 @@ def _load_longest_purchase_lines(output_dir, pd):
     files.sort(key=lambda x: (-x[0], -x[1]))
     base_file = files[0][2]
     base_mtime = files[0][1]
+    # Record which windows were actually unioned so the report can
+    # warn about invoice dates no file on disk covers (see
+    # sale_lines_coverage_gap). 2026-09-16: the Aug-2026 report went
+    # out ~200 orders / ~$60K light because the 730d backfill was last
+    # refreshed 2026-07-21 and the rolling 30d files only reached back
+    # to ~Aug 17 — nothing on disk held Aug 1-16, and nothing said so.
+    _SALE_LINES_WINDOWS.clear()
+    _SALE_LINES_WINDOWS.append((files[0][0], base_mtime))
     try:
         base = pd.read_csv(base_file, low_memory=False)
     except Exception:  # noqa: BLE001
@@ -1369,7 +1434,8 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
 # Slack delivery
 # ---------------------------------------------------------------------------
 def post_pdf_to_slack(pdf_bytes: bytes, month: str,
-                        commentary_slack: Optional[str] = None
+                        commentary_slack: Optional[str] = None,
+                        note: Optional[str] = None,
                         ) -> Tuple[bool, str]:
     """Upload the PDF to Slack via files.getUploadURLExternal ->
     (presigned PUT) -> files.completeUploadExternal, matching the
@@ -1421,6 +1487,8 @@ def post_pdf_to_slack(pdf_bytes: bytes, month: str,
         f"📊 Monthly Metrics report through *{month}* is ready "
         f"— see the attached PDF."
     )
+    if note:
+        comment = f"{note}\n\n{comment}"
     if commentary_slack:
         comment += f"\n\n{commentary_slack}"
     complete_body = slack_sync._slack_post(
@@ -1437,7 +1505,20 @@ def post_pdf_to_slack(pdf_bytes: bytes, month: str,
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def main() -> int:
+def _parse_args(argv: Optional[List[str]] = None):
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Build the Monthly Metrics PDF and post it to Slack.")
+    p.add_argument("--note", default=None,
+                   help="Text prepended to the Slack post (e.g. a "
+                        "correction notice when re-issuing a report).")
+    p.add_argument("--no-slack", action="store_true",
+                   help="Write the PDF to disk only; do not post.")
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = _parse_args(argv)
     month = _target_month()
     current_month = _current_partial_month()
     months = _report_months(current_month, lookback=14)
@@ -1450,6 +1531,16 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         _emit(f"CIN7 data load failed: {exc!r}", level="error")
         return 2
+
+    # Surface (never silently swallow) a sale-lines backfill gap in
+    # the closed month being reported.
+    gap_note = None
+    try:
+        gap_note = sale_lines_coverage_gap(month)
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"coverage check failed (continuing): {exc!r}", level="warn")
+    if gap_note:
+        _emit(gap_note, level="warn")
 
     try:
         # James, 2026-07-23: also compute the prior-year "same
@@ -1490,8 +1581,14 @@ def main() -> int:
     out_path.write_bytes(pdf_bytes)
     _emit(f"wrote {out_path} ({len(pdf_bytes):,} bytes)")
 
+    if args.no_slack:
+        _emit("--no-slack: skipping Slack post")
+        return 0
+
+    note_parts = [x for x in (args.note, f":warning: {gap_note}" if gap_note else None) if x]
     ok, msg = post_pdf_to_slack(pdf_bytes, month,
-                                 commentary_slack=commentary.get("slack"))
+                                 commentary_slack=commentary.get("slack"),
+                                 note="\n".join(note_parts) or None)
     if ok:
         _emit(f"Slack: {msg}")
     else:
