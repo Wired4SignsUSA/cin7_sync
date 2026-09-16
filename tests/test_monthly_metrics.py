@@ -154,3 +154,30 @@ def test_sale_lines_coverage_gap_detects_uncovered_days():
     # Fresh 90d refresh covers the whole closed month -> no warning.
     wins.append((90, ts(today)))
     assert r.sale_lines_coverage_gap(month, wins) is None
+
+
+def test_purchase_loader_does_not_reset_sale_line_windows(tmp_path):
+    """Regression: the 2026-09-16 corrected report warned that all of
+    Aug 2026 was uncovered because _load_longest_purchase_lines
+    clobbered _SALE_LINES_WINDOWS. Loading purchases after sales must
+    leave the sale windows intact."""
+    import os
+    import time
+    import monthly_metrics_report as r
+
+    now = time.time()
+    sl = tmp_path / "sale_lines_last_90d_x.csv"
+    sl.write_text("SaleID,SKU,Quantity,InvoiceNumber,OrderNumber,"
+                  "InvoiceDate,Customer,Total\n"
+                  "a,s,1,i,o,2026-08-05,Cust,10\n")
+    os.utime(sl, (now, now))
+    pl = tmp_path / "purchase_lines_last_1825d_x.csv"
+    pl.write_text("PurchaseID,SKU,Quantity,Total\np,s,1,5\n")
+    old = now - 200 * 86400
+    os.utime(pl, (old, old))
+
+    r._load_longest_sale_lines(tmp_path, pd, lambda df: df)
+    before = list(r._SALE_LINES_WINDOWS)
+    assert before and before[0][0] == 90
+    r._load_longest_purchase_lines(tmp_path, pd)
+    assert list(r._SALE_LINES_WINDOWS) == before

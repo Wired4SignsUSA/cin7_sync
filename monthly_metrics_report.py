@@ -271,14 +271,10 @@ def _load_longest_purchase_lines(output_dir, pd):
     files.sort(key=lambda x: (-x[0], -x[1]))
     base_file = files[0][2]
     base_mtime = files[0][1]
-    # Record which windows were actually unioned so the report can
-    # warn about invoice dates no file on disk covers (see
-    # sale_lines_coverage_gap). 2026-09-16: the Aug-2026 report went
-    # out ~200 orders / ~$60K light because the 730d backfill was last
-    # refreshed 2026-07-21 and the rolling 30d files only reached back
-    # to ~Aug 17 — nothing on disk held Aug 1-16, and nothing said so.
-    _SALE_LINES_WINDOWS.clear()
-    _SALE_LINES_WINDOWS.append((files[0][0], base_mtime))
+    # NB: do NOT touch _SALE_LINES_WINDOWS here — it tracks sale_lines
+    # only. A copy-paste of that bookkeeping into this loader made the
+    # 2026-09-16 corrected report warn falsely that all of Aug 2026
+    # was uncovered (purchase file window replaced the sale windows).
     try:
         base = pd.read_csv(base_file, low_memory=False)
     except Exception:  # noqa: BLE001
