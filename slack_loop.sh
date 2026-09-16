@@ -152,6 +152,9 @@ _run_bg() {
     local name="$1"
     local cmd="$2"
     local pidfile="${BG_PID_DIR}/${name}.pid"
+    if [ "${USE_INNGEST:-0}" = "1" ]; then
+        return   # 2026-09-16: scheduled by inngest_worker.py instead
+    fi
     if [ -e "$pidfile" ] \
             && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
         echo "[$(stamp)] [$name] still running (pid=$(cat "$pidfile")); skipping" >> "$LOG"
@@ -172,6 +175,9 @@ _run_bg() {
 _run_fast() {
     local name="$1" cmd="$2"
     local pidfile="${BG_PID_DIR}/${name}.pid"
+    if [ "${USE_INNGEST:-0}" = "1" ]; then
+        return   # 2026-09-16: scheduled by inngest_worker.py instead
+    fi
     if [ -e "$pidfile" ] \
             && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
         return
@@ -191,6 +197,50 @@ if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
     echo "[$(stamp)] SLACK_BOT_TOKEN not set — exiting cleanly" >> "$LOG"
     exit 0
 fi
+
+# ----------------------------------------------------------------------
+# 2026-09-16 — Inngest takes over the timer-driven jobs (Phase 1).
+# ----------------------------------------------------------------------
+# When INNGEST_EVENT_KEY + INNGEST_SIGNING_KEY are present (and
+# INNGEST_JOBS is not 0) inngest_worker.py runs alongside this loop as a
+# supervised child. It holds an outbound Connect session to Inngest and
+# executes every job that used to fire from the `seconds_since_X` blocks
+# below, on real cron schedules with retries, per-job concurrency and a
+# run history in the Inngest dashboard. To keep the same job from running
+# twice, _run_bg/_run_fast become no-ops here and the two inline blocks
+# (daily refresh chain, housekeeping audit) are guarded explicitly. The
+# timer blocks themselves are left in place for now so INNGEST_JOBS=0 is
+# an instant, code-free fallback; they get deleted once Inngest has run
+# clean for a couple of weeks.
+#
+# What stays in this loop regardless: dataset_mirror pull, slack_sync
+# poll and slack_listener once — the bot itself, not a scheduled job.
+USE_INNGEST=0
+if [ "${INNGEST_JOBS:-1}" != "0" ] \
+        && [ -n "${INNGEST_EVENT_KEY:-}" ] \
+        && [ -n "${INNGEST_SIGNING_KEY:-}" ]; then
+    USE_INNGEST=1
+fi
+
+_supervise_inngest() {
+    local ilog="${DATA_DIR}/output/inngest_worker.log"
+    while true; do
+        echo "[$(stamp)] [supervise] starting inngest_worker" >> "$ilog"
+        python inngest_worker.py >> "$ilog" 2>&1 || true
+        echo "[$(stamp)] [supervise] inngest_worker exited — restarting in 30s" >> "$ilog"
+        sleep 30
+    done
+}
+
+if [ "$USE_INNGEST" = "1" ]; then
+    _supervise_inngest &
+    INNGEST_PID=$!
+    # Kill the python child too, not just the supervisor subshell, so a
+    # Render SIGTERM lets Inngest see a clean disconnect.
+    trap 'pkill -TERM -P $INNGEST_PID 2>/dev/null; kill $INNGEST_PID 2>/dev/null || true' EXIT
+    echo "[$(stamp)] scheduled jobs delegated to Inngest (pid $INNGEST_PID); bash timers disabled" >> "$LOG"
+fi
+
 
 # ----------------------------------------------------------------------
 # v2.67.58 — Bootstrap: first-boot data sync
@@ -419,7 +469,9 @@ while true; do
     # and it also starts at boot, so it must not run alongside the rest of
     # the boot catch-up herd.
     DIM_REFRESH_PID_FILE="${BG_PID_DIR}/dim_refresh.pid"
-    if [ "$seconds_since_dim_refresh" -ge 86400 ]; then
+    if [ "$USE_INNGEST" = "1" ]; then
+        :   # 2026-09-16: worker_daily_refresh function in inngest_worker.py
+    elif [ "$seconds_since_dim_refresh" -ge 86400 ]; then
         # Skip if a previous backgrounded refresh is still running
         if [ -e "$DIM_REFRESH_PID_FILE" ] \
                 && kill -0 "$(cat "$DIM_REFRESH_PID_FILE" 2>/dev/null)" \
@@ -495,7 +547,8 @@ while true; do
     # Always exits 0 — informational only. Reuses last_lessons_epoch's
     # 24h cadence indirectly by gating on the dim_refresh window so
     # we always run audit RIGHT AFTER the daily refresh chain.
-    if [ "$seconds_since_dim_refresh" -ge 86400 ] \
+    if [ "$USE_INNGEST" != "1" ] \
+            && [ "$seconds_since_dim_refresh" -ge 86400 ] \
             && [ -e housekeeping_audit.py ]; then
         echo "[$(stamp)] housekeeping_audit" >> "$LOG"
         python housekeeping_audit.py --verbose \
