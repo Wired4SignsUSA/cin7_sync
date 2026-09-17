@@ -4744,6 +4744,15 @@ _PG_POST_CUTOVER_TABLES = [
           ADD COLUMN IF NOT EXISTS cin7_po_number TEXT,
           ADD COLUMN IF NOT EXISTS approval_error TEXT;
       """),
+    # 2026-09-17 — bot_lessons_learned was snapshotted to Postgres
+    # without its UNIQUE(summary_date); the daily upsert in
+    # bot_self_improvement.py uses ON CONFLICT(summary_date) and
+    # needs a unique index to target.
+    ("bot_lessons_learned_summary_date_unique",
+      """
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_bot_lessons_summary_date
+          ON bot_lessons_learned(summary_date);
+      """),
 ]
 
 

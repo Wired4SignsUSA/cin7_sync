@@ -93,8 +93,33 @@ def _load_stock_bins() -> Optional[pd.DataFrame]:
     if "Location" in out.columns:
         out["Location"] = (out["Location"].fillna("").astype(str)
                               .str.strip())
+    # CIN7 stock exports carry one row per SKU x location/bin, so a
+    # SKU can appear more than once. Collapse to one row per SKU:
+    # first non-empty Bin/Location/Name, OnHand summed.
+    if out["SKU"].duplicated().any():
+        before = len(out)
+        agg = {}
+        for col in ("Bin", "Location", "Name"):
+            if col in out.columns:
+                agg[col] = _first_non_empty
+        if "OnHand" in out.columns:
+            out["OnHand"] = pd.to_numeric(out["OnHand"], errors="coerce")
+            agg["OnHand"] = "sum"
+        out = out.groupby("SKU", as_index=False, sort=False).agg(agg)
+        log.info("Collapsed %d stock rows into %d unique SKUs",
+                 before, len(out))
     log.info("Loaded %s — %d SKU rows", path.name, len(out))
     return out
+
+
+def _first_non_empty(series: pd.Series):
+    for v in series:
+        if isinstance(v, str):
+            if v.strip():
+                return v
+        elif v is not None and not pd.isna(v):
+            return v
+    return ""
 
 
 def _load_bom_pairs() -> List[Tuple[str, str]]:
