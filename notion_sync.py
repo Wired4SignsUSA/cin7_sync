@@ -512,6 +512,55 @@ def _format_row_properties(properties: Dict) -> str:
     return "\n".join(lines)
 
 
+def _walk_database(db_id: str, db_title: Optional[str],
+                   cfg: Dict) -> Optional[List[Dict]]:
+    """Return one page dict per row of a Notion database, or
+    None when the bot cannot read it (a linked view, or a source
+    database not shared with the integration) so the caller can
+    log and skip instead of failing the whole pull."""
+    if not db_title:
+        try:
+            meta = _request("GET", f"/databases/{db_id}", cfg=cfg)
+            db_title = "".join(
+                t.get("plain_text", "")
+                for t in meta.get("title") or []) or "(database)"
+        except RuntimeError as exc:
+            log.warning("  Skipping database %s: %s", db_id, exc)
+            return None
+    log.info("  Walking database %r (%s) ...", db_title, db_id)
+    rows: List[Dict] = []
+    db_cursor = None
+    while True:
+        qbody = {"page_size": 100}
+        if db_cursor:
+            qbody["start_cursor"] = db_cursor
+        try:
+            qres = _request("POST", f"/databases/{db_id}/query",
+                            json_body=qbody, cfg=cfg)
+        except RuntimeError as exc:
+            if "HTTP 400" in str(exc) or "HTTP 404" in str(exc):
+                log.warning("  Skipping database %r (%s): %s",
+                            db_title, db_id, exc)
+                return None
+            raise
+        for row in qres.get("results") or []:
+            row_id = (row.get("id") or "").replace("-", "")
+            title = _row_title(row.get("properties") or {})
+            rows.append({
+                "id": row_id,
+                "title": f"{db_title} — {title}",
+                "last_edited_time": row.get("last_edited_time"),
+                "source": "database_row",
+                # keep the row's properties so the mirrored
+                # content includes column values, not just body.
+                "properties": row.get("properties") or {},
+            })
+        if not qres.get("has_more"):
+            break
+        db_cursor = qres.get("next_cursor")
+    return rows
+
+
 def pull_playbooks(dry_run: bool = False) -> Dict:
     """Walk the children of NOTION_PLAYBOOKS_PARENT_ID (falls
     back to NOTION_TEAM_PARENT_PAGE_ID). For each child_page,
@@ -531,6 +580,7 @@ def pull_playbooks(dry_run: bool = False) -> Dict:
     n_child_pages = 0
     n_databases = 0
     n_db_rows = 0
+    n_skipped_dbs = 0
     while True:
         path = (f"/blocks/{parent}/children?page_size=100"
                 + (f"&start_cursor={cursor}" if cursor else ""))
@@ -547,50 +597,37 @@ def pull_playbooks(dry_run: bool = False) -> Dict:
                     "source": "child_page",
                 })
             elif btype == "child_database":
-                n_databases += 1
                 db_id = b.get("id")
                 db_title = ((b.get("child_database") or {})
                             .get("title") or "(database)")
-                log.info("  Walking database %r (%s) ...",
-                          db_title, db_id)
-                # Query the database for ALL rows; each is a page.
-                db_cursor = None
-                while True:
-                    qbody = {"page_size": 100}
-                    if db_cursor:
-                        qbody["start_cursor"] = db_cursor
-                    qres = _request(
-                        "POST", f"/databases/{db_id}/query",
-                        json_body=qbody, cfg=cfg)
-                    for row in qres.get("results") or []:
-                        row_id = (row.get("id")
-                                  or "").replace("-", "")
-                        title = _row_title(
-                            row.get("properties") or {})
-                        pages.append({
-                            "id": row_id,
-                            "title": f"{db_title} — {title}",
-                            "last_edited_time": row.get(
-                                "last_edited_time"),
-                            "source": "database_row",
-                            # v2.67.256 — keep the row's
-                            # properties so the mirrored
-                            # content includes column values,
-                            # not just the page body.
-                            "properties": row.get(
-                                "properties") or {},
-                        })
-                        n_db_rows += 1
-                    if not qres.get("has_more"):
-                        break
-                    db_cursor = qres.get("next_cursor")
+                rows = _walk_database(db_id, db_title, cfg)
+                if rows is None:
+                    n_skipped_dbs += 1
+                    continue
+                n_databases += 1
+                n_db_rows += len(rows)
+                pages.extend(rows)
         if not body.get("has_more"):
             break
         cursor = body.get("next_cursor")
+    # Linked database views on the parent page expose no data
+    # source to the API. NOTION_PLAYBOOKS_DB_IDS lists the real
+    # source database ids (comma-separated) to walk directly.
+    for db_id in [x.strip() for x in os.environ.get(
+            "NOTION_PLAYBOOKS_DB_IDS", "").split(",") if x.strip()]:
+        rows = _walk_database(db_id, None, cfg)
+        if rows is None:
+            n_skipped_dbs += 1
+            continue
+        n_databases += 1
+        n_db_rows += len(rows)
+        pages.extend(rows)
     log.info(
         "Found %d page(s) to mirror: %d direct child pages + "
-        "%d row(s) across %d database(s)",
-        len(pages), n_child_pages, n_db_rows, n_databases)
+        "%d row(s) across %d database(s); %d database(s) skipped "
+        "as inaccessible",
+        len(pages), n_child_pages, n_db_rows, n_databases,
+        n_skipped_dbs)
     n_ok = 0
     n_err = 0
     for p in pages:
