@@ -263,9 +263,18 @@ def _swap_qmark_to_pct(sql: str) -> str:
             out.append("%s")
             i += 1
             continue
-        # Also handle %s pre-existing — escape as %%s so psycopg
-        # doesn't try to interpolate. But we don't expect any
-        # literal % in db.py SQL, so skip for now.
+        if ch == "%" and in_str:
+            # Literal % inside a string literal (LIKE '% TOKEN %').
+            # psycopg treats a bare % as a placeholder marker when
+            # params are passed, so it must be doubled. Already-
+            # doubled %% is passed through unchanged.
+            if i + 1 < n and sql[i + 1] == "%":
+                out.append("%%")
+                i += 2
+                continue
+            out.append("%%")
+            i += 1
+            continue
         out.append(ch)
         i += 1
     return "".join(out)
@@ -691,6 +700,11 @@ def _selftest() -> int:
             "2) AS roas FROM foo"),
         ("SELECT ROUND(price) FROM foo",
             "SELECT ROUND((price)::numeric) FROM foo"),
+        # Literal % inside string literals must be doubled for psycopg
+        ("SELECT 1 FROM t WHERE (' ' || f || ' ') LIKE ('% ' || ? || ' %')",
+            "SELECT 1 FROM t WHERE (' ' || f || ' ') LIKE ('%% ' || %s || ' %%')"),
+        ("SELECT 1 FROM t WHERE a LIKE '%%x' AND b = ?",
+            "SELECT 1 FROM t WHERE a LIKE '%%x' AND b = %s"),
     ]
     fails = 0
     for sql_in, expected in tests:
