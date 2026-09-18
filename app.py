@@ -58,6 +58,8 @@ from app_pages.sales_recent import render_sales_recent
 from app_pages.stock_explorer import render_stock_explorer
 from data_catalog import file_mtime as catalog_file_mtime
 from data_catalog import latest_file as catalog_latest_file
+from engine import trend_rules as _trend_rules
+from engine.frame_utils import row_records_apply as _row_records_apply
 from engine.sku_rules import _is_strip_sku
 from engine.sku_rules import _parse_length
 from engine.sku_rules import _parse_strip_base
@@ -238,7 +240,16 @@ background ABC warmer is rebuilding.
 - **🔀 Mixed** — 3+ customers are involved, but the spread is not broad
   enough for Trend. Watch signal, no velocity override.
 - **📉 Decline** — units down 50%+ vs prior 45 days. Worth review.
-- **Stable** — everything else.
+- **⚡ Sporadic** — a real product with lumpy demand: sold in 3 or fewer
+  of the last 6 months, or restarted after a silent 45 days with only 1-2
+  buyers while the year shows 3+ buyers. The engine plans on the **lower**
+  of the 12-month and last-6-month rates so one big historic month can't
+  drive a reorder by itself; the range floor still holds one unit/pack.
+- **Stable** — sold in at least 4 of the last 6 months. The 12-month rate
+  is trusted as a run rate.
+
+Each label carries a short **Why** note (buyers in 45d · months sold of
+the last 6 · top-buyer share of the year) so it can be checked at a glance.
 
 **Why "top-2 combined" matters**: 8 customers with one buying 50% and
 a second buying 20% is still concentrated (top-2 = 70%). The tighter
@@ -950,6 +961,27 @@ def _product_image_lookup(products_df: pd.DataFrame,
                 )
                 out[sku] = str(image.get("DownloadUrl") or "")
     return out
+
+
+def _product_image_fingerprint() -> str:
+    """Cache key for the image map: the two source CSV paths + mtimes."""
+    parts = []
+    for prefix in ("products", "product_images"):
+        p = _latest_file(prefix)
+        try:
+            parts.append(f"{p}|{p.stat().st_mtime:.0f}" if p else prefix)
+        except OSError:
+            parts.append(prefix)
+    return "::".join(parts)
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def _product_image_lookup_cached(fingerprint: str) -> dict[str, str]:
+    """Process-wide, read-only SKU → image URL map. 2026-09-18: the
+    uncached version walked 11k product rows on EVERY Ordering rerun
+    (~2.2 s per click). Keyed on the source-file fingerprint so a new
+    products CSV rebuilds it; callers must treat the dict as read-only."""
+    return _product_image_lookup(products, product_images)
 
 
 def file_mtime(prefix: str) -> Optional[datetime]:
@@ -5974,10 +6006,8 @@ def _abc_engine(products: pd.DataFrame,
     vel["top_cust_name_12mo"] = vel["top_cust_name_12mo"].fillna("")
     # momentum (avoid div-by-zero)
     vel["momentum"] = vel.apply(
-        lambda r: (r["units_45d"] / max(r["units_prior_45d"], 1.0)
-                     if r["units_prior_45d"] > 0
-                     else (float("inf")
-                            if r["units_45d"] > 0 else 1.0)),
+        lambda r: _trend_rules.momentum(r["units_45d"],
+                                        r["units_prior_45d"]),
         axis=1,
     )
 
@@ -6023,8 +6053,17 @@ def _abc_engine(products: pd.DataFrame,
         if mom > 1.5:
             top_share = float(r["top_cust_pct"])
             non_top_avg = float(r.get("non_top_avg_units", 0))
-            # Concentrated to 1-2 buyers → genuine one-off project.
+            # Concentrated to 1-2 buyers → genuine one-off project,
+            # UNLESS this is a restart from a zero prior window on a
+            # SKU with diversified 12mo history (3+ buyers, nobody
+            # >50%). That is a real-but-lumpy product → ⚡ Sporadic,
+            # planned on the lower of the 12mo / 6mo rates rather
+            # than discounted like a one-off. (2026-09-18)
             if n_cust <= 2:
+                if uprv <= 0:
+                    return _trend_rules.restart_label(
+                        r.get("customers_12mo", 0),
+                        r.get("top_cust_pct_12mo", 0))
                 return "🎯 Project"
             # Very broad recent customer spread is a real market signal.
             # For strip families and bulk-roll equivalents, units per
@@ -7062,8 +7101,13 @@ def _abc_engine(products: pd.DataFrame,
         # 87-unit historic 12mo total kept the grace active. With
         # zero 90d activity, the SKU is NOT a steady mover anymore
         # — let dormancy detection fire.
-        abc_class = str(row.get("ABC") or "C").strip().upper()
-        if abc_class == "A" and eff_90d > 0:
+        # 2026-09-18 — grace needs evidence demand is alive (2+ buyers
+        # in 45d, or no 90d cliff); see engine.trend_rules.
+        # _refine_dormancy_by_class re-checks with monthly buckets.
+        if _trend_rules.a_class_grace_holds(
+                row.get("ABC"), eff_12mo, eff_90d,
+                row.get("customers_45d", 0),
+                row.get("top_cust_pct_12mo", 0)):
             return False
         # Tier 1: ~zero 90d activity. The threshold is expressed in
         # PHYSICAL UNITS so master rolls and leaf SKUs are compared
@@ -7120,6 +7164,14 @@ def _abc_engine(products: pd.DataFrame,
     _periods24 = calendar_month_periods(today=today_ts, periods=24)
     _pidx12 = {p: i for i, p in enumerate(_periods12)}
     _pidx24 = {p: i for i, p in enumerate(_periods24)}
+    # Calendar days covered by the last 6 monthly buckets (the current
+    # month is partial) — denominator for the ⚡ Sporadic 6mo rate.
+    try:
+        _days_in_last_6mo = max(
+            1.0, float((pd.Timestamp(today_ts)
+                        - _periods12[-6].start_time).days + 1))
+    except Exception:  # noqa: BLE001
+        _days_in_last_6mo = 182.5
     for _, r in sl.iterrows():
         d = r["InvoiceDate"]
         if pd.isna(d):
@@ -7326,11 +7378,14 @@ def _abc_engine(products: pd.DataFrame,
     df["units_45d"] = df["SKU"].astype(str).map(u45_dict).fillna(0)
     df["units_prior_45d"] = df["SKU"].astype(str).map(uprior_dict).fillna(0)
     df["units_90d"] = df["SKU"].astype(str).map(u90_dict).fillna(0)
-    # Recompute momentum from the rolled-up values.
+    # Recompute momentum from the rolled-up values. 2026-09-18: a
+    # restart from a zero prior window must clear the `> 1.5` spike
+    # gate (engine.trend_rules.momentum returns inf, as the first pass
+    # does). The old `1.5` sentinel here kept every "nothing → one
+    # customer" restart labelled Stable (LED-BCF-RGB-IP20-5, James).
     df["momentum"] = df.apply(
-        lambda r: (float(r["units_45d"]) / max(float(r["units_prior_45d"]), 1.0)
-                    if float(r["units_prior_45d"]) > 0
-                    else (1.5 if float(r["units_45d"]) > 0 else 1.0)),
+        lambda r: _trend_rules.momentum(r["units_45d"],
+                                        r["units_prior_45d"]),
         axis=1)
 
     # --- Migration + BOM rollup of customer-level metrics ---------------
@@ -7557,7 +7612,16 @@ def _abc_engine(products: pd.DataFrame,
         cur = r.get("trend_flag", "Stable")
         if pd.isna(cur):
             cur = "Stable"
-        if cur != "Stable":
+        # Stable is upgraded here, plus 🔀 Mixed rows that are a
+        # restart from a zero prior window (2026-09-18: those used to
+        # fall through to Stable and reach this rule — typically new
+        # launches with 3+ buyers, which need the 45d rate, not the
+        # 12mo average). Established Mixed rows are left alone: a
+        # 45d-rate override on a spike would over-order.
+        if cur == "🔀 Mixed" and not _trend_rules.is_restart(
+                r.get("units_45d"), r.get("units_prior_45d")):
+            return cur
+        if cur not in ("Stable", "🔀 Mixed"):
             return cur
         buckets = r.get("trend_12m")
         if not isinstance(buckets, list) or len(buckets) < 6:
@@ -7666,8 +7730,14 @@ def _abc_engine(products: pd.DataFrame,
         eff_12mo_early = float(row.get("effective_units_12mo") or 0)
         eff_90d_early = float(row.get("effective_units_90d") or 0)
         top_share_12mo_early = float(row.get("top_cust_pct_12mo") or 0)
-        if (abc_early == "A" and eff_12mo_early > 0 and eff_90d_early > 0
-                and top_share_12mo_early < 0.5):
+        # 2026-09-18 — grace also needs live-demand evidence (2+ buyers
+        # in 45d, no 90d cliff, or sales in 3+ of the last 6 months).
+        # This pass is the final authority: it can lift a base-rule
+        # flag when the monthly buckets show the SKU is still moving.
+        if _trend_rules.a_class_grace_holds(
+                abc_early, eff_12mo_early, eff_90d_early,
+                row.get("customers_45d", 0), top_share_12mo_early,
+                _trend_rules.active_months(row.get("trend_12m"), 6)):
             return False
         if bool(row.get("is_dormant", False)):
             return True  # already flagged by base rules
@@ -7740,6 +7810,14 @@ def _abc_engine(products: pd.DataFrame,
             top_u = _safe(r.get("top_cust_units_12mo"))
             corrected = max(0.0, eff - top_u)
             return corrected / max(window_days, 1)
+        if flag == _trend_rules.SPORADIC:
+            # Lumpy demand: never let one big historic month drive the
+            # reorder. Plan on the LOWER of the 12mo and last-6mo rates;
+            # the range floor (stock_goal) still holds one unit/pack.
+            return _trend_rules.sporadic_daily_rate(
+                _safe(r.get("effective_units_12mo")),
+                _safe(r.get("last_6mo")),
+                _days_in_last_6mo, window_days)
         # v2.67.354 — Decline velocity override. Pre-v2.67.354 this
         # path did NOTHING — a 📉 Decline SKU kept its 12mo
         # annualised rate, over-ordering against demand that may
@@ -7791,8 +7869,18 @@ def _abc_engine(products: pd.DataFrame,
         cur = r.get("trend_flag", "Stable")
         if pd.isna(cur):
             cur = "Stable"
-        if bool(r.get("is_dormant", False)) and cur == "Stable":
-            return "💤 Dormant"
+        if bool(r.get("is_dormant", False)):
+            # Dormancy wins over Stable and over any label that only
+            # exists because of a restart from a zero prior window
+            # (one small sale after a long silence is not a project
+            # or a trend — it is a dormant SKU that twitched). Labels
+            # earned against a non-zero prior window are preserved.
+            if cur in ("Stable", _trend_rules.SPORADIC):
+                return "💤 Dormant"
+            if (cur in ("🎯 Project", "🔀 Mixed", "📈 Trend")
+                    and _trend_rules.is_restart(
+                        r.get("units_45d"), r.get("units_prior_45d"))):
+                return "💤 Dormant"
         if cur == "Stable":
             eff_12mo = float(r.get("effective_units_12mo") or 0)
             lineage_12mo = float(r.get("lineage_units_12mo") or 0)
@@ -7886,6 +7974,37 @@ def _abc_engine(products: pd.DataFrame,
         return cur
 
     df["trend_flag"] = df.apply(_promote_dormant_flag, axis=1)
+
+    # 2026-09-18 — "Stable" has to earn its name. Anything still Stable
+    # that sold in fewer than 4 of the last 6 calendar months is
+    # ⚡ Sporadic: a real product with lumpy demand. The label drives
+    # a conservative velocity in _adjust_avg_daily (min of 12mo and
+    # 6mo rate) and tells the buyer not to read the 12mo average as a
+    # steady run rate. Dormant/Project/Trend/etc. are left untouched.
+    def _sporadic_from_monthly(r):
+        cur = r.get("trend_flag", "Stable")
+        if pd.isna(cur) or cur != "Stable":
+            return cur
+        if bool(r.get("is_dormant", False)):
+            return cur
+        if float(r.get("effective_units_12mo") or 0) <= 0:
+            return cur
+        if _trend_rules.is_sporadic_months(r.get("trend_12m")):
+            return _trend_rules.SPORADIC
+        return cur
+
+    df["trend_flag"] = df.apply(_sporadic_from_monthly, axis=1)
+
+    # Checkable evidence shown next to the Trend badge — buyers should
+    # be able to see WHY a label was given without opening the trace.
+    df["_days_in_last_6mo"] = _days_in_last_6mo
+    df["trend_evidence"] = df.apply(
+        lambda r: _trend_rules.evidence_text(
+            r.get("customers_45d", 0),
+            _trend_rules.active_months(r.get("trend_12m"), 6),
+            r.get("top_cust_pct_12mo", 0),
+            r.get("customers_12mo", 0)),
+        axis=1)
 
     # v2.67.310 + v2.67.314 — track WHY a SKU is Project so the trace
     # can render the right explanation:
@@ -9204,8 +9323,10 @@ def _build_ordering_context() -> "SimpleNamespace":
             # "3 in 45d, 0 in 12mo" — apparently impossible because
             # the metrics measure different things. Make both
             # measurements explicit.
+            _ev = str(row.get("trend_evidence") or "")
             demand_lines.append(
-                f"\n**Trend signal**: {_tf}  \n"
+                f"\n**Trend signal**: {_tf}"
+                + (f" — _{_ev}_" if _ev else "") + "  \n"
                 f"- Last 45d: **{u45v:.0f} units** "
                 f"(prior 45d: {uprv:.0f}, momentum **{mom_s}**)\n"
                 f"- **{n_cust} customer(s) in last 45d** "
@@ -9225,6 +9346,25 @@ def _build_ordering_context() -> "SimpleNamespace":
                     "instead of 12mo avg because demand is "
                     "accelerating broadly. Engine will build stock "
                     "faster to catch up.\n"
+                )
+            elif _tf == _trend_rules.SPORADIC:
+                _eff12_s = _fnum(row.get("effective_units_12mo"))
+                _l6_s = _fnum(row.get("last_6mo"))
+                _am6 = _trend_rules.active_months(
+                    row.get("trend_12m"), 6)
+                _r12 = _eff12_s / 365.0
+                _r6 = _l6_s / max(_fnum(row.get("_days_in_last_6mo"),
+                                        182.5), 1.0)
+                _used = "last-6mo" if _r6 < _r12 else "12mo"
+                demand_lines.append(
+                    f"- **Why Sporadic**: sold in only **{_am6} of the "
+                    f"last 6 months** (Stable needs 4+), so the 12mo "
+                    f"average is not a run rate.\n"
+                    f"- **Velocity override**: planning on the lower "
+                    f"of 12mo (**{_r12*30.4:.1f}/mo**) and last-6mo "
+                    f"(**{_r6*30.4:.1f}/mo**) → using the "
+                    f"**{_used}** rate. One big historic month "
+                    f"cannot drive this reorder on its own.\n"
                 )
             elif _tf == "📉 Decline":
                 # v2.67.354 — Decline override transparency. Either
@@ -9617,11 +9757,11 @@ def _build_ordering_context() -> "SimpleNamespace":
     # OnHandValue: prefer CIN7's authoritative StockOnHand (FIFO-based
     # dollar value shown in CIN7's Product Availability screen).
     # Fall back to OnHand × AverageCost/FixedCost only when CIN7 returns 0.
-    engine_df["OnHandValue"] = engine_df.apply(
-        lambda r: (float(r["StockOnHand"]) if float(r["StockOnHand"]) > 0
-                   else float(r["OnHand"]) * float(r["AverageCost"])),
-        axis=1,
-    )
+    _soh = pd.to_numeric(engine_df["StockOnHand"], errors="coerce")
+    engine_df["OnHandValue"] = _soh.where(
+        _soh > 0,
+        pd.to_numeric(engine_df["OnHand"], errors="coerce")
+        * pd.to_numeric(engine_df["AverageCost"], errors="coerce"))
     # Per-unit cost chain, priority order:
     #   1. CIN7 StockOnHand ÷ OnHand  (real FIFO)
     #   2. Supplier FixedCost  (already in UnitCost via cin7_cost_local)
@@ -9636,7 +9776,9 @@ def _build_ordering_context() -> "SimpleNamespace":
             return sv / oh
         return float(r["AverageCost"] or 0)
 
-    engine_df["_direct_cost"] = engine_df.apply(_direct_unit_cost, axis=1)
+    engine_df["_direct_cost"] = _row_records_apply(
+        engine_df, _direct_unit_cost,
+        ("StockOnHand", "OnHand", "AverageCost"))
 
     # Compute family-prefix median cost
     def _family_prefix(sku: str) -> str:
@@ -9668,7 +9810,9 @@ def _build_ordering_context() -> "SimpleNamespace":
             return float(cat_med), "category-median"
         return 0.0, "unknown"
 
-    _cost_apply = engine_df.apply(_effective_unit_cost, axis=1)
+    _cost_apply = _row_records_apply(
+        engine_df, _effective_unit_cost,
+        ("_direct_cost", "_family_prefix", "Category"))
     engine_df["EffectiveUnitCost"] = _cost_apply.apply(lambda x: x[0])
     engine_df["CostBasisDetail"] = _cost_apply.apply(lambda x: x[1])
     engine_df["TargetValue"] = (
@@ -9795,7 +9939,13 @@ def _build_ordering_context() -> "SimpleNamespace":
         else:
             base = "🟢 On target"
         return f"❗ {base}" if once_slow else base
-    engine_df["Status"] = engine_df.apply(_status, axis=1)
+    _STATUS_COLS = (
+        "SKU", "OnHand", "Allocated", "avg_daily", "bulk_length_m",
+        "display_units_12mo", "effective_units_12mo", "is_bulk_master",
+        "lead_time_days", "lineage_units_12mo", "reorder_qty",
+        "target_stock", "units_12mo")
+    engine_df["Status"] = _row_records_apply(engine_df, _status,
+                                             _STATUS_COLS)
     # Final Status overrides happen after the computed status pass so
     # the displayed buyer action cannot be overwritten by cached or
     # earlier labels.
@@ -14119,8 +14269,12 @@ elif page == "Ordering":
     # Glossary — click-to-reveal definitions for every buyer-facing term.
     # Keep terminology single-sourced here so edits propagate via search.
     # ------------------------------------------------------------------
-    with st.expander(
-        "📖 How to read this page — glossary & methodology",
+    # 2026-09-18 — glossary and AI chat share one row so the page
+    # opens on the supplier, not on two full-width help panels
+    # (James: "the supplier gets lost in the buzz").
+    _help_col, _ai_col = st.columns(2)
+    with _help_col, st.expander(
+        "📖 How to read this page",
         expanded=False,
     ):
         # v2.67.49 — single-source glossary. Edit at the top of
@@ -14140,7 +14294,7 @@ elif page == "Ordering":
     # channel_intent="po_review" routes to the reorder-focused system
     # prompt copy (PO drafts, backorders, stock decisions).
     # ------------------------------------------------------------------
-    with st.expander(
+    with _ai_col, st.expander(
         "🤖 Ask the AI about ordering",
         expanded=False,
     ):
@@ -14311,9 +14465,10 @@ elif page == "Ordering":
     sc_row1 = st.columns([3, 2])
     with sc_row1[0]:
         sel_label = st.selectbox(
-            "Supplier  (top 15 ordered by 12mo spend, then A-Z)",
+            "Supplier",
             dropdown_labels,
             key="ord_supplier_label",
+            help="Top 15 by 12-month spend first, then A-Z.",
         )
         sel_sup = label_to_supplier[sel_label]
         st.session_state["ordering_active_supplier"] = sel_sup
@@ -14334,6 +14489,13 @@ elif page == "Ordering":
                 "(respects supplier's air max length — 3m+ items excluded)."
             ),
         )
+
+    # 2026-09-18 — supplier header card. Filled in further down once
+    # the supplier-wide stock figures exist (see "Supplier-wide
+    # snapshot"); declared here so it sits directly under the picker,
+    # above drafts and filters, and the buyer always knows whose PO
+    # they are looking at.
+    _supplier_card = st.container(border=True)
 
     # ------------------------------------------------------------------
     # PO DRAFT SELECTOR (multi-draft per supplier with lifecycle)
@@ -14567,23 +14729,28 @@ elif page == "Ordering":
         )
 
     # Filter & apply ABC filter
-    fc1, fc2, fc3 = st.columns(3)
-    abc_filter = fc1.multiselect("ABC classes",
+    fc1, fc2, fc3 = st.columns([2, 3, 2])
+    abc_filter = fc1.multiselect("Class",
                                     ["A", "B", "C", "—"],
                                     default=["A", "B", "C"],
-                                    key="ord_abc_filter")
+                                    key="ord_abc_filter",
+                                    help="ABC class by 12-month value.")
     status_filter = fc2.multiselect(
-        "Status filter",
+        "Status",
         ["🔴 Reorder now", "🟠 Reorder soon",
           "🟢 On target", "🔵 Overstocked",
           "💀 Dead stock", "⚪ No demand, no stock"],
         default=["🔴 Reorder now", "🟠 Reorder soon"],
         key="ord_status_filter",
     )
-    only_reorder_positive = fc3.checkbox(
-        "Only show SKUs with reorder suggestion > 0",
-        value=True, key="ord_only_reorder",
-    )
+    with fc3:
+        st.markdown("<div style='height:1.9rem'></div>",
+                    unsafe_allow_html=True)
+        only_reorder_positive = st.checkbox(
+            "Only SKUs needing reorder",
+            value=True, key="ord_only_reorder",
+            help="Hide rows whose suggested reorder is 0.",
+        )
 
     # --- Hide non-master items from the reorder workspace entirely ---
     # Non-masters (MP variants, cuts, 01X2 packs from 10X2 masters, etc.)
@@ -14606,7 +14773,8 @@ elif page == "Ordering":
     if not ordering_supplier_snapshot_used:
         all_supplier_df = orderable_df[orderable_df["Supplier"] == sel_sup]
 
-    _product_images_by_sku = _product_image_lookup(products, product_images)
+    _product_images_by_sku = _product_image_lookup_cached(
+        _product_image_fingerprint())
     _product_names_by_sku = {}
     if (not products.empty
             and {"SKU", "Name"}.issubset(set(products.columns))):
@@ -15117,21 +15285,43 @@ elif page == "Ordering":
         all_supplier_including_variants["is_non_master_tube"].sum()
     )
 
-    st.markdown(f"**{sel_sup}** — supplier-wide snapshot "
-                f"(showing **{sw_skus:,} master/orderable SKUs**; "
-                f"{non_master_count:,} assembled variants hidden and "
-                f"rolled up to their masters):")
-    _render_stock_health_tiles(
-        current=sw_stock_value, goal=sw_goal_value,
-        excess=sw_excess_value, understock=sw_understock_value,
-        dead=sw_dead_value, dead_skus=_sw_health["dead_sku_count"],
-        reorder_level=sw_reorder_level_value,
-        scope=f"{sel_sup} products",
-        goal_help=("How much of this supplier's stock we should be "
-                   "holding: days of cover by A/B/C class, never below "
-                   "the reorder level, at least one unit/pack of every "
-                   "live SKU. Same method as Stock Optimisation and the "
-                   "Command Centre."))
+    # Supplier header card (declared under the picker above). Name in
+    # large type, one fact line, then the four standard stock tiles —
+    # replaces the old bold "supplier-wide snapshot (showing …)" text.
+    with _supplier_card:
+        _sup_cfg = supp_configs.get(sel_sup, {}) or {}
+        _facts = [f"**${spend_by_supplier.get(sel_sup, 0):,.0f}** "
+                  "spend / 12mo",
+                  f"**{sw_skus:,}** orderable SKUs"
+                  + (f" ({non_master_count:,} variants rolled up)"
+                     if non_master_count else ""),
+                  f"**{len(_drafts_for_supplier)}** active draft"
+                  + ("" if len(_drafts_for_supplier) == 1 else "s")]
+        _lt_sea = _sup_cfg.get("lead_time_sea_days")
+        _lt_air = _sup_cfg.get("lead_time_air_days")
+        if _lt_sea or _lt_air:
+            _facts.append(
+                "lead time " + " / ".join(
+                    x for x in (f"sea **{int(_lt_sea)}d**" if _lt_sea else "",
+                                f"air **{int(_lt_air)}d**" if _lt_air else "")
+                    if x))
+        if _sup_cfg.get("mov_amount"):
+            _facts.append(
+                f"min order **{_fmt_money(_sup_cfg.get('mov_amount'))}"
+                f"{(' ' + str(_sup_cfg.get('mov_currency'))) if _sup_cfg.get('mov_currency') else ''}**")
+        st.markdown(f"## {sel_sup}")
+        st.markdown(" · ".join(_facts))
+        _render_stock_health_tiles(
+            current=sw_stock_value, goal=sw_goal_value,
+            excess=sw_excess_value, understock=sw_understock_value,
+            dead=sw_dead_value, dead_skus=_sw_health["dead_sku_count"],
+            reorder_level=sw_reorder_level_value,
+            scope=f"{sel_sup} products",
+            goal_help=("How much of this supplier's stock we should be "
+                       "holding: days of cover by A/B/C class, never below "
+                       "the reorder level, at least one unit/pack of every "
+                       "live SKU. Same method as Stock Optimisation and the "
+                       "Command Centre."))
 
     # --- Filtered PO summary strip ---
     st.markdown("---")
@@ -15243,7 +15433,7 @@ elif page == "Ordering":
     # "Reset layout" or adds them back.
     default_editor_cols = [
         "Include?", "Image", "🔍", "SKU", "Name", "ABC", "Status", "Category",
-        "trend_flag",
+        "trend_flag", "trend_evidence",
         "trend_12m", "last_6mo_series", "last_12mo_series", "units_12mo",
         "units_45d", "momentum", "customers_45d", "top_cust_pct",
         "avg_daily", "avg_month", "recent_avg_mo", "LengthMM",
@@ -15302,6 +15492,7 @@ elif page == "Ordering":
         ("sku_moq", "sku_lead_time_days"),
         ("sku_eoq_qty", "sku_moq"),
         ("recent_avg_mo", "avg_month"),
+        ("trend_evidence", "trend_flag"),
     ]
     for _new, _after in _NEWLY_INTRODUCED_COLS:
         if _new not in editor_cols and _new in default_editor_cols:
@@ -15355,6 +15546,7 @@ elif page == "Ordering":
         "Exclude?": "🚫 Exclude from reorder",
         "Dropship?": "📦 Dropship (order-on-demand)",
         "trend_flag": "📈 Trend signal",
+        "trend_evidence": "Why (trend evidence)",
         "units_45d": "45d units",
         "momentum": "Momentum (45d vs prior)",
         "customers_45d": "Customers 45d",
@@ -15369,7 +15561,8 @@ elif page == "Ordering":
     PRESETS = {
         "Buyer essentials (default)": [
             "Include?", "Image", "SKU", "Name", "ABC", "Status",
-            "trend_flag", "last_6mo_series", "last_12mo_series",
+            "trend_flag", "trend_evidence", "last_6mo_series",
+            "last_12mo_series",
             "avg_month", "recent_avg_mo",
             "OnHand", "Available", "OnOrder", "unfulfilled",
             "target_stock", "reorder_qty", "freight_mode",
@@ -16073,7 +16266,8 @@ elif page == "Ordering":
                     "lineage_units_12mo",
                     "Category", "Name",
                     # Trend-detection fields
-                    "trend_flag", "units_45d", "units_prior_45d",
+                    "trend_flag", "trend_evidence",
+                    "units_45d", "units_prior_45d",
                     "customers_45d", "top_cust_pct",
                     "top_2_cust_pct", "non_top_avg_units",
                     "top_cust_name", "top_cust_units_12mo",
@@ -16348,10 +16542,23 @@ elif page == "Ordering":
                      "recent velocity). 🎯 Project = one-off concentrated to "
                      "1 customer (engine discounts the spike). "
                      "🔀 Mixed = watch. 📉 Decline = down 50%+. "
+                     "⚡ Sporadic = sold in 3 or fewer of the last 6 "
+                     "months (engine plans on the lower of the 12mo "
+                     "and 6mo rates). "
                      "💤 Dormant = had history but no activity in 90d "
                      "(engine drops reorder to 0 — confirm before manual "
-                     "override). Stable = normal. See glossary.",
-                disabled=True, width="small",
+                     "override). Stable = sold in 4+ of the last 6 "
+                     "months. Hover the Why column for the evidence.",
+                disabled=True, width="medium",
+            ),
+            "trend_evidence": st.column_config.TextColumn(
+                "Why",
+                help="Evidence behind the Trend label: distinct buyers "
+                     "in the last 45 days · months with sales out of "
+                     "the last 6 · top buyer's share of the 12mo "
+                     "units (or buyer count for the year when nobody "
+                     "dominates).",
+                disabled=True, width="medium",
             ),
             "units_45d": st.column_config.NumberColumn(
                 "45d units",
@@ -16362,7 +16569,9 @@ elif page == "Ordering":
                 "Momentum",
                 format="%.2fx", disabled=True,
                 help="Ratio of last 45d units to prior 45d units. "
-                     ">1.5 = spike; <0.5 = decline.",
+                     ">1.5 = spike; <0.5 = decline. Blank = sold in "
+                     "the last 45d after nothing in the prior 45d "
+                     "(a restart — treated as a spike).",
             ),
             "customers_45d": st.column_config.NumberColumn(
                 "Customers 45d",
@@ -25409,7 +25618,7 @@ elif page == "AI Assistant":
                 "to see the rating consistently, not infer "
                 "absence. Use the literal value from the column: "
                 "`Stable`, `📈 Trend`, `🎯 Project`, `🔀 Mixed`, "
-                "or `📉 Decline`.\n"
+                "`⚡ Sporadic`, `💤 Dormant` or `📉 Decline`.\n"
                 "Required format example:\n"
                 "  `⚠️ SLOW — LED-31.171-6 — Elite Gold 2400K "
                 "15W/m 6m — **0.07 on hand** — ABC=C — 📉 "
@@ -25454,12 +25663,15 @@ elif page == "AI Assistant":
                 "  - `ABC` ∈ {A, B, C} — Pareto class on 12mo "
                 "revenue. A = top performers, C = long tail.\n"
                 "  - `trend_flag` ∈ {'Stable', '📈 Trend', "
-                "'🎯 Project', '🔀 Mixed', '📉 Decline'} — the "
+                "'🎯 Project', '🔀 Mixed', '⚡ Sporadic', "
+                "'💤 Dormant', '📉 Decline'} — the "
                 "Ordering page's sales-staff rating. Per RULES.md "
                 "§3: 📈 Trend = broad-based acceleration (≥4 "
                 "customers, top-cust <40%); 🎯 Project = "
                 "concentrated to 1-2 buyers; 🔀 Mixed = spike "
-                "without clean Trend/Project pattern; 📉 Decline "
+                "without clean Trend/Project pattern; ⚡ Sporadic "
+                "= sold in 3 or fewer of the last 6 months (lumpy, "
+                "engine plans conservatively); 📉 Decline "
                 "= falling momentum. ALWAYS surface this when "
                 "non-Stable.\n"
                 "  - `is_dormant` (bool) — engine's authoritative "

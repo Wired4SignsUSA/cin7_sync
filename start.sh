@@ -120,8 +120,18 @@ SYNC_PID=$!
 trap "kill $NEARSYNC_PID $SYNC_PID 2>/dev/null || true" EXIT
 
 # Streamlit in the foreground.
+# 2026-09-18 — runner.magicEnabled=false: Streamlit's "magic" pass
+# re-walks the whole 29k-line app.py AST every time it (re)compiles
+# the script (first load after all tabs close, every deploy) — ~10 s
+# of the ~18 s a buyer waited on a cold open. app.py and app_pages/*
+# use no bare-expression magic (audited: zero rewrites), so this is
+# free. Keep it off; write st.write()/st.markdown() explicitly.
+# server.fileWatcherType=none: nothing edits source on Render, and the
+# watcher would clear the bytecode cache on false positives.
 exec streamlit run app.py \
   --server.port "${PORT:-8501}" \
   --server.address 0.0.0.0 \
   --server.headless true \
+  --server.fileWatcherType none \
+  --runner.magicEnabled false \
   --browser.gatherUsageStats false
