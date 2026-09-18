@@ -166,6 +166,10 @@ JOBS: list[Job] = [
         "python fablab_assemblies.py check-po", fast=True, retries=0),
     Job("fablab_alert_check_replies", "1-59/5 * * * *",
         "python fablab_stock_alert.py check-replies", retries=0),
+    Job("finishing_oneoff_scan", "2-59/3 * * * *",
+        "python finishing_oneoff.py scan", fast=True, retries=0,
+        note="One-off finishing requests typed in #powdercoating-anodize-control "
+             "-> plan reply, `approve` -> BOM + assembly + All Star draft PO"),
     Job("po_dispatch_reminder", "2-59/5 * * * *",
         "python po_dispatch_reminder.py daily",
         env=("SLACK_FULFILLMENT_CHANNEL_ID",), retries=0),

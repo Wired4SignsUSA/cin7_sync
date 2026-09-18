@@ -1499,6 +1499,26 @@ CREATE TABLE IF NOT EXISTS fablab_stock_alerts (
     approval_error   TEXT
 );
 
+-- 2026-09-18 — one-off finishing requests from raw stock, parsed from the
+-- finishing control channel (finishing_oneoff.py). One row per Slack
+-- request message; status proposed → placed | cancelled | error.
+CREATE TABLE IF NOT EXISTS finishing_oneoff_requests (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    slack_channel TEXT NOT NULL,
+    slack_ts      TEXT NOT NULL,
+    requested_by  TEXT,
+    request_text  TEXT,
+    plan_json     TEXT,
+    status        TEXT NOT NULL DEFAULT 'proposed',
+    approved_by   TEXT,
+    draft_id      INTEGER,
+    po_number     TEXT,
+    error         TEXT,
+    created_at    TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    updated_at    TIMESTAMP,
+    UNIQUE (slack_channel, slack_ts)
+);
+
 -- v2.67.126 Slack OAuth user tokens (for Viktor bridge from
 -- dashboard). Each staff member who wants the dashboard to
 -- forward marketing questions to Viktor on their behalf
@@ -3293,6 +3313,43 @@ def record_fablab_stock_alert_approval(
 
 
 # ---------------------------------------------------------------------------
+# One-off finishing requests (finishing_oneoff.py, 2026-09-18)
+# ---------------------------------------------------------------------------
+
+def create_finishing_oneoff_request(channel: str, ts: str, requested_by: str,
+                                    request_text: str, plan: dict,
+                                    status: str = "proposed") -> None:
+    import json as _json
+    with connect() as c:
+        c.execute(
+            "INSERT INTO finishing_oneoff_requests "
+            "(slack_channel, slack_ts, requested_by, request_text, plan_json, status) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (channel, ts, requested_by, request_text, _json.dumps(plan, default=str), status))
+
+
+def list_finishing_oneoff_requests(channel: str, open_only: bool = True) -> List[sqlite3.Row]:
+    sql = "SELECT * FROM finishing_oneoff_requests WHERE slack_channel = ?"
+    if open_only:
+        sql += " AND status = 'proposed'"
+    with connect() as c:
+        return c.execute(sql + " ORDER BY id", (channel,)).fetchall()
+
+
+def update_finishing_oneoff_request(req_id: int, *, status: str,
+                                    approved_by: Optional[str] = None,
+                                    draft_id: Optional[int] = None,
+                                    po_number: Optional[str] = None,
+                                    error: Optional[str] = None) -> None:
+    with connect() as c:
+        c.execute(
+            "UPDATE finishing_oneoff_requests SET status = ?, approved_by = ?, "
+            "draft_id = ?, po_number = ?, error = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (status, approved_by, draft_id, po_number, error, req_id))
+
+
+# ---------------------------------------------------------------------------
 # Viktor bridge — Slack user OAuth tokens (v2.67.126)
 # ---------------------------------------------------------------------------
 def upsert_slack_user_token(user_id: int, slack_user_id: str,
@@ -4752,6 +4809,26 @@ _PG_POST_CUTOVER_TABLES = [
       """
       CREATE UNIQUE INDEX IF NOT EXISTS ux_bot_lessons_summary_date
           ON bot_lessons_learned(summary_date);
+      """),
+    # 2026-09-18 — one-off finishing requests (finishing_oneoff.py).
+    ("finishing_oneoff_requests",
+      """
+      CREATE TABLE IF NOT EXISTS finishing_oneoff_requests (
+          id            BIGSERIAL PRIMARY KEY,
+          slack_channel TEXT NOT NULL,
+          slack_ts      TEXT NOT NULL,
+          requested_by  TEXT,
+          request_text  TEXT,
+          plan_json     TEXT,
+          status        TEXT NOT NULL DEFAULT 'proposed',
+          approved_by   TEXT,
+          draft_id      BIGINT,
+          po_number     TEXT,
+          error         TEXT,
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at    TIMESTAMPTZ,
+          UNIQUE (slack_channel, slack_ts)
+      );
       """),
 ]
 

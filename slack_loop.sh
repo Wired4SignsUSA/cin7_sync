@@ -384,6 +384,7 @@ last_merchant_epoch=0      # v2.67.118 Google Merchant Center
 last_fablab_autotag_epoch=0  # 2026-09-01 865FabLab corner auto-tag
 last_fablab_stock_alert_epoch=0       # 2026-09-01 865FabLab stock-drop alerts
 last_fablab_alert_replies_epoch=0     # 2026-09-02 865FabLab Slack-reply approval poll
+last_finishing_oneoff_epoch=0         # 2026-09-18 one-off finishing requests scan
 last_fablab_assembly_po_epoch=0        # 2026-09-04 865FabLab labor-PO authorised watch
 last_fablab_assembly_replies_epoch=0   # 2026-09-04 865FabLab assembly `done` replies
 last_po_dispatch_epoch=0   # v2.67.130 PO dispatch reminders
@@ -723,6 +724,16 @@ while true; do
         last_fablab_alert_replies_epoch=$(date -u +%s)
         _run_bg "fablab_alert_check_replies" \
             "python fablab_stock_alert.py check-replies"
+    fi
+
+    # 2026-09-18 one-off finishing requests typed in the finishing control
+    # channel ("Powder coat LED-X white x20 from raw stock"): post a plan
+    # in-thread, `approve` reply -> BOM + assembly + All Star draft PO.
+    seconds_since_finishing_oneoff=$(( now_epoch - last_finishing_oneoff_epoch ))
+    if [ "$seconds_since_finishing_oneoff" -ge 180 ]; then
+        last_finishing_oneoff_epoch=$(date -u +%s)
+        _run_fast "finishing_oneoff_scan" \
+            "python finishing_oneoff.py scan"
     fi
 
     # 2026-09-04 865FabLab assembly flow (fablab_assemblies.py):
