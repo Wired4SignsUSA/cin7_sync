@@ -210,7 +210,14 @@ from rolled family demand while keeping an older direct-only Trend label.
 - **🎯 Project** — when the spike is concentrated to **1-2 distinct customers**, when last-12mo demand is concentrated into only **1-2 customers** with little recent activity, or when visible 12mo lineage demand exists but effective reorder demand is zero. Engine subtracts the top customer's 12mo contribution from effective demand before forecasting where applicable; visible-only project rows stay at zero auto-reorder unless the buyer manually overrides. Project rows do **not** auto-round up to supplier MOQ; the buyer can still override the order qty manually when a known project exists.
 - **🔀 Mixed** — spike (momentum >1.5) with 3+ customers involved, but the spread is not broad enough for Trend. Watch signal; no velocity override.
 - **📉 Decline** — momentum < 0.5. Manual review.
-- **Stable** — everything else.
+- **⚡ Sporadic** (2026-09-18) — a real product with lumpy demand. Either (a) still "Stable" after all other checks but sold in **3 or fewer of the last 6 calendar months**, or (b) a spike concentrated to 1-2 recent buyers that is a **restart from a zero prior-45d window** on a SKU with diversified history (**customers_12mo ≥ 3** and **top_cust_pct_12mo < 50%**). Velocity override: `avg_daily = min(12mo rate, last-6mo rate)`, where the 6mo rate is the last 6 monthly buckets ÷ the calendar days they cover. The range floor (§ stock goal) still holds one unit/pack. Example: LED-BCF-RGB-IP20-5 — 80 units/12mo but 33 in one month, 0-0-0 then 3.6 to one buyer → Sporadic, plan on ~2.3/mo not 6.7/mo.
+- **Stable** — everything else, which now means: sold in **at least 4 of the last 6 months**. The 12mo rate is trusted as a run rate.
+
+**Momentum with a zero prior window** — `units_prior_45d == 0` and `units_45d > 0` is an infinite jump (`engine/trend_rules.momentum`), so it clears the `> 1.5` spike gate. Before 2026-09-18 the post-rollup recompute returned exactly 1.5, which never cleared the gate and left every restart labelled Stable.
+
+**A-class dormancy grace** — ABC is a $ rank, not a steadiness signal. The grace that exempts A-class SKUs from soft dormancy requires `effective_units_90d > 0`, `top_cust_pct_12mo < 50%` **and** evidence demand is alive: **customers_45d ≥ 2**, or the 90d rate is still ≥ 20% of the 12mo rate, or sales in **3+ of the last 6 months** (`engine/trend_rules.a_class_grace_holds`).
+
+**Evidence column** — every row carries `trend_evidence` ("1 buyer/45d · sold 3/6 mo · top buyer 47% of 12mo") so the label is checkable in the Ordering grid ("Why" column) and in the calc trace.
 
 **Low-volume guard**: SKUs with <3 units in last 45d bypass classification unless there are **10+ distinct recent customers**. For bulk rolls and cut families, units may be fractional roll-equivalents while customer spread is the stronger signal.
 

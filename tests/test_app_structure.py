@@ -1256,7 +1256,7 @@ class AppMemoryStructureTests(unittest.TestCase):
             no_demand_pos,
         )
         status_apply_pos = script.index(
-            'engine_df["Status"] = engine_df.apply(_status, axis=1)',
+            'engine_df["Status"] = _row_records_apply(engine_df, _status,',
             dead_pos,
         )
         dropship_final_pos = script.index(
