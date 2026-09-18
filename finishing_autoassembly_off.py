@@ -14,7 +14,7 @@ service line (same candidate list as the planner). Dry-run by default.
   python finishing_autoassembly_off.py --apply    # PUT /product with AutoAssembly=false
   python finishing_autoassembly_off.py --sku LED-AL-PL55B-FL-2 --apply
 
-CIN7 rules: PUT /product needs the GET body minus CreatedDate (else 409);
+CIN7 rules: PUT /product needs the full GET-by-ID body (IncludeBOM=true etc.) minus CreatedDate (else 409/400);
 GET /product?Sku= is an exact match with IncludeBOM optional. Rate limit
 honoured via cin7_post_finishedgoods._http (DEFAULT_RATE_S).
 """
@@ -72,7 +72,24 @@ def run(skus: list[str], apply: bool) -> dict:
         if not apply:
             out["would_change"].append(sku)
             continue
-        body = dict(prod)
+        # The Sku-search body omits BillOfMaterialsProducts/Suppliers/
+        # ReorderLevels; PUT with an empty BOM list fails 400
+        # ("Required attribute 'BillOfMaterialsProduct' not provided").
+        # Re-fetch by ID with the Include* flags to get the full record.
+        resp, last_call = _http("GET", f"{BASE_URL}/product", headers,
+                                params={"ID": prod.get("ID"), "IncludeBOM": "true",
+                                        "IncludeSuppliers": "true",
+                                        "IncludeReorderLevels": "true"},
+                                log=log, rate_s=DEFAULT_RATE_S, last_call=last_call)
+        if resp is None or resp.status_code != 200:
+            out["errors"].append(f"{sku}: GET(ID) {resp.status_code if resp is not None else 'network'}")
+            continue
+        full = [p for p in (resp.json() or {}).get("Products") or []
+                if p.get("ID") == prod.get("ID")]
+        if not full or not full[0].get("BillOfMaterialsProducts"):
+            out["errors"].append(f"{sku}: full record has no BillOfMaterialsProducts")
+            continue
+        body = dict(full[0])
         body.pop("CreatedDate", None)
         body["AutoAssembly"] = False
         resp, last_call = _http("PUT", f"{BASE_URL}/product", headers, json_body=body,
