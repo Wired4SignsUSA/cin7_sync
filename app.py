@@ -6517,7 +6517,7 @@ def _abc_engine(products: pd.DataFrame,
     # any that look wrong.
     _demand_reclass_skus: set = set()
 
-    def _global_is_master(sku: str) -> bool:
+    def _global_is_master(sku: str, _depth: int = 0) -> bool:
         """A SKU is a MASTER (orderable, counts its own demand) if
         there's evidence it's bought from a supplier, AND it's not
         explicitly marked as assembled-from. Detection priority:
@@ -6561,12 +6561,27 @@ def _abc_engine(products: pd.DataFrame,
             return True
         # 4: BOM flag or BOM-has-components, single-component only
         # (see docstring #4 above for why 2+ components is exempt)
-        n_bom_components = len(bom_components_by_asm.get(sku, []))
+        _comps = bom_components_by_asm.get(sku, [])
+        n_bom_components = len(_comps)
         if n_bom_components == 1:
             return False
         if n_bom_components == 0 and bom_flag_by_sku.get(sku):
             return False
         if n_bom_components >= 2:
+            # 2026-09-18 (James): a "base + cover" cut such as
+            # LED-WALLE12-W-0609 (0.21 × base 3m + 0.21 × cover 3m) or
+            # LED-SKIRT10-W-0150 (1 × base-0150 + 1 × cover-0150, both
+            # themselves cuts) is factory work on stock we already
+            # buy, not a supplier line. It is a CUT KIT — non-master —
+            # when every component is either a fractional cut (<1 of a
+            # longer piece) or itself a non-master cut SKU. Genuine
+            # multi-part assemblies (whole units of orderable parts)
+            # keep their own demand, as v2.67.394 intended.
+            if _depth < 4 and all(
+                    float(q) < 1.0
+                    or not _global_is_master(c, _depth + 1)
+                    for c, q in _comps if c != sku):
+                return False
             _demand_reclass_skus.add(sku)
         # 1: Supplier assigned (without any Assemble-from / BOM evidence)
         if sku in has_cin7_supplier:

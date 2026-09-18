@@ -46,6 +46,8 @@ Anything else is a child / phantom / cut / assembly.
 - **Method C — SKU substitution.** Fallback when sourcing rule names a master SKU.
 - **Method D — Family-prefix sibling.** If all else fails, find a master SKU sharing the same family prefix (e.g. `LED-01.018-*`) and use it.
 
+**2.4.1 Cut kits are not orderable.** A multi-component assembly is still a factory cut — NON-master, demand rolled to its components — when every component is either a fractional quantity (<1 of a longer piece) or itself a non-master cut SKU. Examples: `LED-WALLE12-W-0609` = 0.21 × base 3m + 0.21 × cover 3m; `LED-SKIRT10-W-0150` = 1 × base-0150 + 1 × cover-0150 (both cuts of 3m masters); 3D-printed elbows from fractional filament; Snapfix 25-sets packed from 100/250 component packs. Genuine assemblies of whole orderable parts keep their own demand (v2.67.394). 2026-09-18 check: none of the 190 SKUs this reclassified had a purchase line in 730 days.
+
 **2.5 LED strip rollup — convert metres to active buying-roll units.** Strip cuts sold in metres must be converted: `consumption_master_rolls = consumption_metres / active_buying_roll_length`. Not `×100`. The earlier bug inflated target stock by 100×. If a larger historical family member is discontinued, retired, or inactive, it must not steal demand from the current active buying roll; e.g. a discontinued 50m roll should not stop a live 25m roll from receiving 5m/per-foot family demand.
 
 **2.6 Multi-component kit rollup.** Kit sales (LEDKIT-*, LEDFIX-*) distribute demand to EVERY component in the BOM proportionally — not just the first component. Each component separately gets `kit_sales × its_BOM_quantity`.
