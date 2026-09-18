@@ -14398,7 +14398,12 @@ elif page == "Ordering":
     # workbench without scrolling past periodic/admin content. See
     # _build_ordering_context for the shared setup all three pages use.
     # --- Supplier-focused view -----------------------------------------
-    st.markdown("### :clipboard: Draft PO — by supplier")
+    # 2026-09-18 — supplier header card. The picker + freight mode sit
+    # in its top row; name, facts and stock tiles are filled in further
+    # down once the supplier-wide stock figures exist (see
+    # "Supplier-wide snapshot"). One block, so the buyer always knows
+    # whose PO they are looking at without a stray dropdown above it.
+    _supplier_card = st.container(border=True)
 
     # Supplier dropdown: top 15 by 12mo spend first, then remainder
     # alphabetically. Spend = sum of purchase_lines.Total per supplier.
@@ -14462,10 +14467,11 @@ elif page == "Ordering":
     dropdown_labels = [_label(s) for s in dropdown_options]
     label_to_supplier = dict(zip(dropdown_labels, dropdown_options))
 
-    sc_row1 = st.columns([3, 2])
+    with _supplier_card:
+        sc_row1 = st.columns([3, 2])
     with sc_row1[0]:
         sel_label = st.selectbox(
-            "Supplier",
+            ":clipboard: Draft PO — by supplier",
             dropdown_labels,
             key="ord_supplier_label",
             help="Top 15 by 12-month spend first, then A-Z.",
@@ -14489,13 +14495,6 @@ elif page == "Ordering":
                 "(respects supplier's air max length — 3m+ items excluded)."
             ),
         )
-
-    # 2026-09-18 — supplier header card. Filled in further down once
-    # the supplier-wide stock figures exist (see "Supplier-wide
-    # snapshot"); declared here so it sits directly under the picker,
-    # above drafts and filters, and the buyer always knows whose PO
-    # they are looking at.
-    _supplier_card = st.container(border=True)
 
     # ------------------------------------------------------------------
     # PO DRAFT SELECTOR (multi-draft per supplier with lifecycle)
@@ -15285,9 +15284,9 @@ elif page == "Ordering":
         all_supplier_including_variants["is_non_master_tube"].sum()
     )
 
-    # Supplier header card (declared under the picker above). Name in
-    # large type, one fact line, then the four standard stock tiles —
-    # replaces the old bold "supplier-wide snapshot (showing …)" text.
+    # Supplier header card body (picker sits in its top row, declared
+    # above). Name in large type, one fact line, then the four standard
+    # stock tiles — replaces the old "supplier-wide snapshot" text.
     with _supplier_card:
         _sup_cfg = supp_configs.get(sel_sup, {}) or {}
         _facts = [f"**${spend_by_supplier.get(sel_sup, 0):,.0f}** "
