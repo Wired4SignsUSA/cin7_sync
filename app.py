@@ -14403,7 +14403,13 @@ elif page == "Ordering":
     # down once the supplier-wide stock figures exist (see
     # "Supplier-wide snapshot"). One block, so the buyer always knows
     # whose PO they are looking at without a stray dropdown above it.
+    # Three stacked sub-containers so render order is fixed regardless
+    # of where in the script each part is written: head (picker),
+    # body (name/facts/tiles, filled late), drafts (filled early).
     _supplier_card = st.container(border=True)
+    _card_head = _supplier_card.container()
+    _card_body = _supplier_card.container()
+    _card_drafts = _supplier_card.container()
 
     # Supplier dropdown: top 15 by 12mo spend first, then remainder
     # alphabetically. Spend = sum of purchase_lines.Total per supplier.
@@ -14467,7 +14473,7 @@ elif page == "Ordering":
     dropdown_labels = [_label(s) for s in dropdown_options]
     label_to_supplier = dict(zip(dropdown_labels, dropdown_options))
 
-    with _supplier_card:
+    with _card_head:
         sc_row1 = st.columns([3, 2])
     with sc_row1[0]:
         sel_label = st.selectbox(
@@ -14537,11 +14543,13 @@ elif page == "Ordering":
         _draft_opts.append(label)
         _draft_opt_to_id[label] = d["id"]
 
-    _drafts_row = st.container(border=True)
+    # Drafts live in the bottom section of the supplier card (2026-09-18)
+    # so supplier → stock health → working draft reads as one panel.
+    _drafts_row = _card_drafts
     with _drafts_row:
+        st.markdown("---")
         st.markdown(
-            f"**📋 PO drafts for {sel_sup}** "
-            f"— {len(_drafts_for_supplier)} active"
+            f"**📋 PO drafts** — {len(_drafts_for_supplier)} active"
             + (f", {len(_archived_drafts)} archived"
                 if _archived_drafts else ""))
 
@@ -15287,7 +15295,7 @@ elif page == "Ordering":
     # Supplier header card body (picker sits in its top row, declared
     # above). Name in large type, one fact line, then the four standard
     # stock tiles — replaces the old "supplier-wide snapshot" text.
-    with _supplier_card:
+    with _card_body:
         _sup_cfg = supp_configs.get(sel_sup, {}) or {}
         _facts = [f"**${spend_by_supplier.get(sel_sup, 0):,.0f}** "
                   "spend / 12mo",
