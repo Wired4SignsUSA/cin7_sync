@@ -490,8 +490,9 @@ def scan(apply: bool = True) -> dict:
                 warn = ("\n:warning: " + "\n:warning: ".join(out["warnings"])) if out.get("warnings") else ""
                 fablab_slack.post(
                     f":white_check_mark: Approved by {who} — assembly {asm} AUTHORISED, "
-                    f"All Star PO *{out.get('po_number')}* created as DRAFT (needs "
-                    f"authorising in CIN7; pick list + vendor sheet post here once it is)."
+                    f"All Star PO *{out.get('po_number')}* created as DRAFT — Cheran, "
+                    f"Andrew or Jamie: check the price and authorise it in CIN7; pick list "
+                    f"+ vendor sheet post here once it is."
                     f"{bom_note}{warn}", channel_id=ch, thread_ts=r["slack_ts"])
                 stats["placed"] += 1
             else:
