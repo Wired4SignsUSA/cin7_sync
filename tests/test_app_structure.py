@@ -1232,7 +1232,7 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertLess(final_trend_pos, monthly_trend_pos)
         self.assertLess(monthly_trend_pos, promote_pos)
         self.assertIn("if u45v < 3 and n_cust < 10:", script)
-        self.assertIn("if n_cust >= 10:", script)
+        self.assertIn("_trend_rules.spike_is_broad(", script)
         self.assertIn("Sustained monthly lift catches products", script)
         self.assertIn(
             "final rolled metrics are the source of truth",

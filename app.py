@@ -6069,7 +6069,11 @@ def _abc_engine(products: pd.DataFrame,
             # For strip families and bulk-roll equivalents, units per
             # non-top customer can be fractional, so the generic
             # non_top_avg >= 2 rule is too harsh.
-            if n_cust >= 10:
+            # …but only when nobody owns the spike (2026-09-18: one
+            # buyer at 85% of 45d units with 9 small buyers is not a
+            # market trend — it is Mixed, planned on the 12mo rate).
+            if _trend_rules.spike_is_broad(
+                    n_cust, top_share, r.get("top_2_cust_pct")):
                 return "📈 Trend"
             # 3+ distinct buyers = diversified demand, never Project.
             # Broad spread + meaningful non-top volume = real Trend;
@@ -7647,7 +7651,8 @@ def _abc_engine(products: pd.DataFrame,
         # sparkline is plainly rising even when the 45d/prior-45d
         # window alone is too narrow or lumpy. Example shape:
         # 16 19 11 -> 31 17 25.
-        if cust_45d >= 10 and ratio >= 1.20 and lift >= 3:
+        if (cust_45d >= 10 and ratio >= 1.20 and lift >= 3
+                and top_share < _trend_rules.TREND_MAX_TOP_SHARE):
             return "📈 Trend"
         if top_share < 0.60 and ratio >= 1.35 and lift >= 6:
             return "📈 Trend"
@@ -7802,8 +7807,13 @@ def _abc_engine(products: pd.DataFrame,
         if flag == "📈 Trend":
             u45 = _safe(r.get("units_45d"))
             if u45 > 0:
-                # last-45d daily velocity (units per day)
-                return (u45 / 45.0)
+                # 45d velocity, with one dominant buyer's spike swapped
+                # for their 12mo run rate and a 3× cap vs the 12mo rate
+                # (2026-09-18, LED-C8020021-2: 193 → realistic).
+                return _trend_rules.trend_daily_rate(
+                    u45, _safe(r.get("top_cust_pct")),
+                    _safe(r.get("top_cust_units_12mo")),
+                    _safe(r.get("effective_units_12mo")), window_days)
         if flag == "🎯 Project":
             eff = _safe(r.get("effective_units_12mo"))
             # Subtract top customer's 12mo contribution
@@ -8003,7 +8013,8 @@ def _abc_engine(products: pd.DataFrame,
             r.get("customers_45d", 0),
             _trend_rules.active_months(r.get("trend_12m"), 6),
             r.get("top_cust_pct_12mo", 0),
-            r.get("customers_12mo", 0)),
+            r.get("customers_12mo", 0),
+            top_share_45d=r.get("top_cust_pct", 0)),
         axis=1)
 
     # v2.67.310 + v2.67.314 — track WHY a SKU is Project so the trace

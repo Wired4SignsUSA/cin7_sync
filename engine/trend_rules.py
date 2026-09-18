@@ -36,6 +36,17 @@ STABLE_MIN_ACTIVE_MONTHS_6 = 4
 SPIKE_MOMENTUM = 1.5
 # 90d-vs-12mo soft-dormancy threshold (share of the 12mo daily rate).
 SOFT_DORMANCY_RATIO = 0.20
+# A spike is only a market TREND when no single buyer owns most of it.
+# 2026-09-18: LED-C8020021-2 had 10 buyers/45d but one took 85% of
+# 212 units; the "10+ buyers" shortcut called it Trend and the engine
+# planned on 4.7/day (12mo rate 1.0/day) → suggested 193 units.
+TREND_MAX_TOP_SHARE = 0.50
+# Above this 45d share the Trend planning rate strips the top buyer's
+# spike back to their own 12mo run rate.
+TREND_TOP_SHARE_BLEND = 0.40
+# Trend never plans above this multiple of the 12mo rate — recent
+# velocity is trusted, one hot window is not.
+TREND_MAX_MULTIPLE_OF_12MO = 3.0
 
 
 def momentum(units_45d: float, units_prior_45d: float) -> float:
@@ -153,14 +164,62 @@ def sporadic_daily_rate(eff_12mo: float,
 def evidence_text(customers_45d: int,
                   active_months_6: int,
                   top_share_12mo: float,
-                  customers_12mo: int) -> str:
+                  customers_12mo: int,
+                  top_share_45d: Optional[float] = None) -> str:
     """Short, checkable evidence shown next to the Trend badge."""
     c45 = int(customers_45d or 0)
-    parts = [f"{c45} buyer{'s' if c45 != 1 else ''}/45d",
-             f"sold {int(active_months_6 or 0)}/6 mo"]
+    parts = [f"{c45} buyer{'s' if c45 != 1 else ''}/45d"]
+    s45 = float(top_share_45d or 0)
+    if c45 >= 2 and s45 >= TREND_TOP_SHARE_BLEND:
+        parts.append(f"one buyer {s45:.0%} of 45d")
+    parts.append(f"sold {int(active_months_6 or 0)}/6 mo")
     share = float(top_share_12mo or 0)
     if share >= 0.3:
         parts.append(f"top buyer {share:.0%} of 12mo")
     else:
         parts.append(f"{int(customers_12mo or 0)} buyers/12mo")
     return " · ".join(parts)
+
+
+def spike_is_broad(customers_45d: int,
+                   top_share_45d: float,
+                   top_2_share_45d: Optional[float] = None) -> bool:
+    """A 45d spike counts as broad-based (Trend) only if 10+ buyers AND
+    no single buyer holds ``TREND_MAX_TOP_SHARE`` or more of the units
+    (top-2 combined < 70% when known)."""
+    if int(customers_45d or 0) < 10:
+        return False
+    if float(top_share_45d or 0) >= TREND_MAX_TOP_SHARE:
+        return False
+    if top_2_share_45d is not None and float(top_2_share_45d) >= 0.70:
+        return False
+    return True
+
+
+def trend_daily_rate(units_45d: float,
+                     top_share_45d: float,
+                     top_cust_units_12mo: float,
+                     eff_12mo: float,
+                     window_days: int = 365) -> float:
+    """Planning rate for a TREND SKU.
+
+    * Base: last-45d velocity.
+    * If one buyer took ≥``TREND_TOP_SHARE_BLEND`` of the 45d units,
+      replace their spike with their own 12mo run rate so the rest of
+      the market sets the pace.
+    * Never more than ``TREND_MAX_MULTIPLE_OF_12MO`` × the 12mo rate.
+    """
+    u45 = float(units_45d or 0)
+    if u45 <= 0:
+        return 0.0
+    win = max(int(window_days or 365), 1)
+    share = float(top_share_45d or 0)
+    rate = u45 / 45.0
+    if share >= TREND_TOP_SHARE_BLEND:
+        others = u45 * (1.0 - share) / 45.0
+        top_run = float(top_cust_units_12mo or 0) / win
+        rate = others + top_run
+    r12 = float(eff_12mo or 0) / win
+    if r12 > 0:
+        rate = min(rate, TREND_MAX_MULTIPLE_OF_12MO * r12)
+    return max(0.0, rate)

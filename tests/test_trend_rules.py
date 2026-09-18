@@ -65,3 +65,30 @@ def test_evidence_text():
     assert s == "1 buyer/45d · sold 3/6 mo · top buyer 47% of 12mo"
     s2 = tr.evidence_text(8, 6, 0.18, 29)
     assert s2 == "8 buyers/45d · sold 6/6 mo · 29 buyers/12mo"
+
+
+def test_spike_is_broad_needs_spread_not_just_headcount():
+    # LED-C8020021-2 2026-09-18: 10 buyers but one took 85%.
+    assert not tr.spike_is_broad(10, 0.85)
+    assert tr.spike_is_broad(10, 0.30)
+    assert not tr.spike_is_broad(9, 0.10)
+    assert not tr.spike_is_broad(12, 0.35, top_2_share_45d=0.75)
+
+
+def test_trend_daily_rate_strips_dominant_buyer_and_caps():
+    # 212 units/45d, top buyer 85%, who bought 205 over the year;
+    # 12mo total 367 → 12mo rate ≈1.0/day. Raw 45d rate would be 4.7.
+    rate = tr.trend_daily_rate(212, 0.85, 205, 367, 365)
+    others = 212 * 0.15 / 45          # ≈0.71
+    assert abs(rate - (others + 205 / 365)) < 1e-9
+    assert rate < 1.5
+    # Broad spike, no dominant buyer → plain 45d rate, but capped at 3×12mo.
+    assert abs(tr.trend_daily_rate(45, 0.2, 0, 365, 365) - 1.0) < 1e-9
+    assert abs(tr.trend_daily_rate(900, 0.2, 0, 365, 365) - 3.0) < 1e-9
+    assert tr.trend_daily_rate(0, 0.9, 10, 100) == 0.0
+
+
+def test_evidence_text_names_dominant_recent_buyer():
+    txt = tr.evidence_text(10, 6, 0.56, 30, top_share_45d=0.85)
+    assert "one buyer 85% of 45d" in txt
+    assert "one buyer" not in tr.evidence_text(10, 6, 0.2, 30, top_share_45d=0.2)
