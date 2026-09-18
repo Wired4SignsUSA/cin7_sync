@@ -207,6 +207,10 @@ JOBS: list[Job] = [
         "python fablab_corner_autotag.py run", env=CIN7_ENV, cin7=True),
     Job("fablab_stock_alert", "0 7 * * *",
         "python fablab_stock_alert.py run", cin7=True),
+    Job("finishing_stock_alert", "10 7 * * *",
+        "python fablab_stock_alert.py run --flow finishing", cin7=True,
+        note="All Star finishing SKUs below reorder level -> "
+             "#powdercoating-anodize-control (James 2026-09-18)"),
     Job("qbo_monthly_pl", "0 8 * * *", "python qbo_monthly_pl.py sync"),
     Job("shopify_discounts", "20 8 * * *",
         "python shopify_discounts.py sync", env=SHOPIFY_ENV),

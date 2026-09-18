@@ -22,8 +22,15 @@ Data loading follows slack_listener.py's _get_data_for_listener()
 pattern -- prefers the dashboard's canonical engine_output.csv,
 falls back to worker_engine.compute_engine_signals().
 
+2026-09-18 (James, SO-62212): same scan for the All Star finishing flow
+-- candidates = every SKU with an OSC-POWDERCOAT-*/OSC-ANODIZING-* BOM
+line, posted to #powdercoating-anodize-control; an "approve" reply
+places the finishing order (AUTHORISED assemblies + Draft PO).
+
 CLI:
-  python fablab_stock_alert.py run
+  python fablab_stock_alert.py run                    # 865FabLab build list
+  python fablab_stock_alert.py run --flow finishing   # All Star finishing
+  python fablab_stock_alert.py check-replies          # both flows
 """
 
 from __future__ import annotations
@@ -45,11 +52,24 @@ import db  # noqa: E402
 import fablab_slack  # noqa: E402
 from data_paths import OUTPUT_DIR  # noqa: E402
 from app_pages.fablab_work_orders import (  # noqa: E402
-    build_planner_table, FABLAB_FLAG_TYPE, FABLAB_SUPPLIER)
+    build_planner_table, bom_service_skus, FABLAB_FLAG_TYPE, FABLAB_SUPPLIER)
+from outsource_flows import FABLAB, FINISHING, FLOWS, Flow  # noqa: E402
 
 log = logging.getLogger("fablab_stock_alert")
 
 DEFAULT_WEEKS_COVER = 6.0
+# Weeks of cover per flow -- mirrors each planner page's default.
+WEEKS_COVER = {FABLAB.key: 6.0, FINISHING.key: 8.0}
+
+
+def flow_for_alert(alert_row) -> Flow:
+    """Flow an alert belongs to, from the channel it was posted in
+    (finishing alerts go to the All Star control channel)."""
+    ch = str(alert_row["posted_channel"] or "")
+    for f in FLOWS.values():
+        if ch and ch == f.channel_id:
+            return f
+    return FABLAB
 
 
 def _build_bom_parents(boms_df: pd.DataFrame) -> dict:
@@ -112,12 +132,16 @@ def _load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
 
 
 def _format_alert(sku: str, name: str, suggested: float,
-                    materials_status: str, rule: dict | None) -> str:
+                    materials_status: str, rule: dict | None,
+                    open_so: float = 0.0, flow: Flow = FABLAB) -> str:
     lines = [
         f":rotating_light: *{sku}* dropped below reorder level -- "
-        f"suggested batch *{suggested:g}* ({materials_status})",
+        f"suggested {flow.short} batch *{suggested:g}* ({materials_status})",
         name,
     ]
+    if open_so > 0:
+        lines.append(f"Open sales orders waiting: *{open_so:g}* units")
+    lines.append("Reply `approve` in this thread to place the order.")
     if rule:
         lines.append(f"\n*{rule['RuleCode']}: {rule['Name']}*")
         lines.extend(f"{i}. {step}"
@@ -125,7 +149,7 @@ def _format_alert(sku: str, name: str, suggested: float,
     return "\n".join(lines)
 
 
-def run(apply: bool = True) -> dict:
+def run(apply: bool = True, flow: Flow = FABLAB) -> dict:
     from engine.sku_rules import parse_corner_bom_rule
 
     products, stock, engine_df, bom_parents = _load_data()
@@ -134,16 +158,26 @@ def run(apply: bool = True) -> dict:
                  .set_index("SKU").to_dict(orient="index")
         if not products.empty else {})
 
-    flag_rows = [f for f in db.list_flags(active_only=True)
-                  if f["flag_type"] == FABLAB_FLAG_TYPE]
-    flagged_skus = sorted({r["sku"] for r in flag_rows})
+    if flow is FINISHING:
+        # Same candidate list as the Finishing Work Orders page.
+        flagged_skus = sorted(bom_service_skus(bom_parents, FINISHING))
+    else:
+        flag_rows = [f for f in db.list_flags(active_only=True)
+                      if f["flag_type"] == FABLAB_FLAG_TYPE]
+        flagged_skus = sorted({r["sku"] for r in flag_rows})
     if not flagged_skus:
-        log.info("No 865FabLab build-list SKUs flagged; nothing to check.")
+        log.info("No %s SKUs to check.", flow.short)
         return {"alerted": [], "cleared": []}
 
+    try:
+        wip_map = db.fablab_wip_by_sku()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("fablab_wip_by_sku failed: %s", exc)
+        wip_map = {}
     planner_df = build_planner_table(
         flagged_skus, products, stock, engine_df, bom_parents,
-        weeks_cover=DEFAULT_WEEKS_COVER)
+        weeks_cover=WEEKS_COVER.get(flow.key, DEFAULT_WEEKS_COVER),
+        wip_map=wip_map)
     if planner_df.empty:
         log.info("Planner table came back empty; nothing to check.")
         return {"alerted": [], "cleared": []}
@@ -160,17 +194,19 @@ def run(apply: bool = True) -> dict:
                 prod.get("AdditionalAttribute2"))
             text = _format_alert(
                 sku, row.get("Name") or "", suggested,
-                row.get("Materials status") or "", rule)
+                row.get("Materials status") or "", rule,
+                open_so=float(row.get("Open SO") or 0), flow=flow)
             posted_ts = None
             error_msg = None
             if apply:
-                posted_ts, error_msg = fablab_slack.post(text)
+                posted_ts, error_msg = fablab_slack.post(
+                    text, channel_id=flow.channel_id)
             log.info("Alerting %s (suggested batch %.1f)%s",
                       sku, suggested,
                       f" -- POST FAILED: {error_msg}" if error_msg else "")
             if apply:
                 db.record_fablab_stock_alert(
-                    sku, suggested, fablab_slack.FABLAB_CHANNEL_ID,
+                    sku, suggested, flow.channel_id,
                     posted_ts, error_msg=error_msg)
             alerted.append(sku)
         elif suggested <= 0 and already_active:
@@ -220,6 +256,32 @@ def _approve_alert(alert_row, reply_user: str) -> tuple[bool, dict]:
         return False, {"error": "suggested_batch is 0 -- nothing to order"}
 
     actor = f"slack:{reply_user or 'unknown'}"
+    flow = flow_for_alert(alert_row)
+    if flow is FINISHING:
+        # Finishing: AUTHORISED CIN7 assembly + Draft PO to All Star via
+        # the same place_order() the Finishing Work Orders page uses.
+        import fablab_assemblies
+        products, _stock, _engine, bom_parents = _load_data()
+        product_map = (
+            products.drop_duplicates("SKU", keep="last")
+                     .set_index("SKU").to_dict(orient="index")
+            if not products.empty else {})
+        draft_id = db.create_po_draft(
+            supplier=FINISHING.supplier,
+            name=f"Slack approval {date.today().isoformat()} {sku}",
+            actor=actor,
+            note=f"Auto-created from Slack approval reply on {sku}")
+        db.upsert_po_draft_line(draft_id, sku, qty, actor)
+        res = fablab_assemblies.place_order(
+            draft_id, bom_parents, product_map, actor=actor, apply=True,
+            flow=FINISHING)
+        if res.get("ok"):
+            return True, {"cin7_po_id": None,
+                           "cin7_po_number": res.get("po_number"),
+                           "draft_id": draft_id}
+        return False, {"error": "; ".join(res.get("errors") or [])
+                       or "place_order failed"}
+
     draft_id = db.create_po_draft(
         supplier=FABLAB_SUPPLIER,
         name=f"Slack approval {date.today().isoformat()}", actor=actor,
@@ -335,7 +397,7 @@ def _setup_log(verbose: bool = False) -> None:
 
 def cmd_run(args: argparse.Namespace) -> int:
     _setup_log(args.verbose)
-    result = run(apply=not args.dry_run)
+    result = run(apply=not args.dry_run, flow=FLOWS[args.flow])
     log.info("Done. Alerted %d, cleared %d.",
               len(result["alerted"]), len(result["cleared"]))
     return 0
@@ -349,6 +411,8 @@ def main() -> int:
     p_run = sub.add_parser("run", help="Scan and post stock-drop alerts")
     p_run.add_argument("--dry-run", action="store_true",
                         help="Log what would be posted without posting")
+    p_run.add_argument("--flow", choices=sorted(FLOWS), default=FABLAB.key,
+                        help="Which outsource flow to scan (default: fablab)")
     p_run.set_defaults(func=cmd_run)
 
     p_replies = sub.add_parser(

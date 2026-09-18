@@ -714,6 +714,8 @@ while true; do
         last_fablab_stock_alert_epoch=$(date -u +%s)
         _run_bg "fablab_stock_alert" \
             "python fablab_stock_alert.py run"
+        _run_bg "finishing_stock_alert" \
+            "python fablab_stock_alert.py run --flow finishing"
     fi
 
     seconds_since_fablab_alert_replies=$(( now_epoch - last_fablab_alert_replies_epoch ))

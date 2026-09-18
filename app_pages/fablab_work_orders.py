@@ -57,14 +57,14 @@ def _stock_by_sku(stock: pd.DataFrame) -> dict[str, dict[str, float]]:
     if stock is None or stock.empty or "SKU" not in stock.columns:
         return {}
     df = stock.copy()
-    for col in ("OnHand", "Available", "OnOrder"):
+    for col in ("OnHand", "Available", "OnOrder", "Allocated"):
         if col not in df.columns:
             df[col] = 0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
     grouped = (
         df.groupby("SKU", dropna=False)
         .agg(OnHand=("OnHand", "sum"), Available=("Available", "sum"),
-             OnOrder=("OnOrder", "sum"))
+             OnOrder=("OnOrder", "sum"), Allocated=("Allocated", "sum"))
         .reset_index()
     )
     return grouped.set_index("SKU").to_dict(orient="index")
@@ -113,8 +113,9 @@ def build_planner_table(
     weeks_cover: float,
     wip_map: Optional[dict] = None,
 ) -> pd.DataFrame:
-    """One row per flagged SKU: demand, on-hand, WIP already in production,
-    suggested batch (net of WIP), and whether raw-material stock covers it.
+    """One row per flagged SKU: demand, open sales orders, on-hand, WIP
+    already in production, suggested batch (net of WIP), and whether
+    raw-material stock covers it.
     wip_map: {sku: {"qty": float, "refs": [..]}} from db.fablab_wip_by_sku()."""
     wip_map = wip_map or {}
     stock_map = _stock_by_sku(stock)
@@ -148,8 +149,13 @@ def build_planner_table(
         # If demand rises, only the extra shows up — as a new order.
         wip = _num(wip_map.get(sku, {}).get("qty", 0))
         wip_refs = ", ".join(wip_map.get(sku, {}).get("refs", []))
+        # 2026-09-18 (James, SO-62212): committed demand counts too.
+        # CIN7 "Allocated" = units on open authorised sales orders
+        # (including backordered qty), so a one-off 50-unit web order
+        # shows up as 50 to build, not as the 12-month average.
+        open_so = _num(stk.get("Allocated", 0))
         suggested = float(math.ceil(
-            max(0.0, target_for_window - on_hand - wip) - 1e-9))
+            max(0.0, target_for_window + open_so - on_hand - wip) - 1e-9))
 
         buildable, material_bits, components = _buildable_from_stock(
             sku, bom_parents, stock_map)
@@ -174,6 +180,7 @@ def build_planner_table(
             "ABC": eng.get("ABC") or "",
             "Status": eng.get("Status") or "",
             "On hand": round(on_hand, 1),
+            "Open SO": int(round(open_so)),
             "WIP": int(round(wip)),
             "WIP ref": wip_refs,
             "Monthly demand": round(monthly_demand, 2),
@@ -1030,6 +1037,10 @@ def render_fablab_work_orders(
             "Include": st.column_config.CheckboxColumn(
                 "✔ Include", help="Tick to put this SKU on the order."),
             "On hand": st.column_config.NumberColumn(format="%.1f"),
+            "Open SO": st.column_config.NumberColumn(
+                "📦 Open SO", format="%d",
+                help="Units on open (authorised, unshipped) sales orders in CIN7, "
+                     "backorders included. Added to the target."),
             "WIP": st.column_config.NumberColumn(
                 "🏭 WIP", format="%d",
                 help="Already in production at 865FabLab (open assemblies "
@@ -1038,7 +1049,7 @@ def render_fablab_work_orders(
                 "WIP ref", help="Assembly / order the WIP belongs to."),
             "Monthly demand": st.column_config.NumberColumn(format="%.2f"),
             "Suggested batch": st.column_config.NumberColumn(
-                format="%d", help="Target − on hand − WIP, rounded up to "
+                format="%d", help="Target + open SO − on hand − WIP, rounded up to "
                                   "whole units."),
             "Buildable from stock": st.column_config.NumberColumn(format="%.1f"),
             "Batch qty": st.column_config.NumberColumn(

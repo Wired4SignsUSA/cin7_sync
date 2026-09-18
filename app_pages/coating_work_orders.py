@@ -233,7 +233,7 @@ def render_finishing_work_orders(
         or (pretick_all and pd.notna(sug) and float(sug) > 0)
         for sku, sug in zip(planner_df["SKU"], planner_df["Suggested batch"])]
     order = ["Include", "SKU", "Name", "Process", "Colour", "ABC", "Status",
-             "On hand", "WIP", "WIP ref", "Monthly demand", "Suggested batch",
+             "On hand", "Open SO", "WIP", "WIP ref", "Monthly demand", "Suggested batch",
              "Batch qty", "Raw profile", "Buildable from stock", "Materials status",
              "Materials", "Service (BOM)", "Auto-assembly"]
     planner_df = planner_df[[c for c in order if c in planner_df.columns]]
@@ -269,13 +269,17 @@ def render_finishing_work_orders(
             "Include": st.column_config.CheckboxColumn(
                 "✔ Include", help="Tick to put this SKU on the order."),
             "On hand": st.column_config.NumberColumn(format="%.1f"),
+            "Open SO": st.column_config.NumberColumn(
+                "📦 Open SO", format="%d",
+                help="Units on open (authorised, unshipped) sales orders in CIN7, "
+                     "backorders included. Added to the target."),
             "WIP": st.column_config.NumberColumn(
                 "🎨 WIP", format="%d",
                 help="Already out at All Star (open assemblies not yet marked "
                      "done). Counted as covered."),
             "Monthly demand": st.column_config.NumberColumn(format="%.2f"),
             "Suggested batch": st.column_config.NumberColumn(
-                format="%d", help="Target − on hand − WIP, whole units."),
+                format="%d", help="Target + open SO − on hand − WIP, whole units."),
             "Buildable from stock": st.column_config.NumberColumn(
                 "Raw covers", format="%.1f",
                 help="How many can be made from raw profile on hand."),
