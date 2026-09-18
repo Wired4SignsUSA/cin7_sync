@@ -14204,180 +14204,188 @@ elif page == "Sales Recent":
 # ---------------------------------------------------------------------------
 
 elif page == "Ordering":
-    st.header("🛒 Ordering")
-    with st.expander("Page notes", expanded=False):
+    # Title slot: filled with the chosen supplier once the picker has
+    # run so the vendor name is the page headline (James 2026-09-18).
+    _title_slot = st.empty()
+    _title_slot.header("🛒 Ordering")
+
+    # 2026-09-18 — everything that is not "pick a supplier and order"
+    # (engine status, recompute, glossary, AI chat) renders at the foot
+    # of the page via this closure. James: buyer should land on the
+    # picker and get straight into the lines.
+    def _render_ordering_footer() -> None:
+        st.markdown("---")
         st.caption(
             "Unified buying workspace. ABC classification on 12-month "
             "velocity. Supplier-first workflow with freight-mode-aware "
-            "lead times, transparent calculations, and draft-PO staging."
-        )
-
-    # v2.67.346 — explicit recompute button. The engine snapshot is
-    # shared across sessions, and supplier/config changes can leave
-    # buyers wondering whether the numbers on screen reflect the latest
-    # inputs. This starts a background rebuild and keeps the current
-    # last-good snapshot live until the fresh output lands.
-    _rc1, _rc2, _rc3 = st.columns([6, 2, 2])
-    with _rc2:
-        _eng_mtime = _engine_output_mtime()
-        _eng_status = _read_engine_refresh_status()
-        if _engine_refresh_running():
-            if _eng_mtime:
+            "lead times, transparent calculations, and draft-PO staging.")
+        # v2.67.346 — explicit recompute button. The engine snapshot is
+        # shared across sessions, and supplier/config changes can leave
+        # buyers wondering whether the numbers on screen reflect the latest
+        # inputs. This starts a background rebuild and keeps the current
+        # last-good snapshot live until the fresh output lands.
+        _rc1, _rc2, _rc3 = st.columns([6, 2, 2])
+        with _rc2:
+            _eng_mtime = _engine_output_mtime()
+            _eng_status = _read_engine_refresh_status()
+            if _engine_refresh_running():
+                if _eng_mtime:
+                    _eng_at = datetime.fromtimestamp(_eng_mtime)
+                    _stamp = _eng_at.strftime("%Y-%m-%d %H:%M")
+                    st.caption(
+                        "ABC refresh **running in background** · using "
+                        f"snapshot from {_stamp} server time")
+                else:
+                    st.caption("ABC refresh **running in background**")
+            elif _eng_mtime:
                 _eng_at = datetime.fromtimestamp(_eng_mtime)
+                _age_str = _format_engine_age(_eng_at)
                 _stamp = _eng_at.strftime("%Y-%m-%d %H:%M")
-                st.caption(
-                    "ABC refresh **running in background** · using "
-                    f"snapshot from {_stamp} server time")
+                _state = str(_eng_status.get("state") or "").lower()
+                if _state == "failed":
+                    st.caption(
+                        f"ABC using last-good snapshot **{_age_str}** "
+                        f"({_stamp} server time). Last refresh failed.")
+                else:
+                    st.caption(
+                        f"ABC updated **{_age_str}** "
+                        f"({_stamp} server time)")
             else:
-                st.caption("ABC refresh **running in background**")
-        elif _eng_mtime:
-            _eng_at = datetime.fromtimestamp(_eng_mtime)
-            _age_str = _format_engine_age(_eng_at)
-            _stamp = _eng_at.strftime("%Y-%m-%d %H:%M")
-            _state = str(_eng_status.get("state") or "").lower()
-            if _state == "failed":
-                st.caption(
-                    f"ABC using last-good snapshot **{_age_str}** "
-                    f"({_stamp} server time). Last refresh failed.")
-            else:
-                st.caption(
-                    f"ABC updated **{_age_str}** "
-                    f"({_stamp} server time)")
-        else:
-            st.caption("Engine snapshot **not created yet**")
-    with _rc3:
-        if st.button(
-            "🔄 Recompute now",
-            key="ord_recompute_now",
-            help="Force a fresh engine rebuild so any recent config "
-                 "changes (supplier settings, freight rules, holiday "
-                 "closures, SKU-supplier assignments) take effect "
-                 "without blocking the page.",
-            width="stretch",
+                st.caption("Engine snapshot **not created yet**")
+        with _rc3:
+            if st.button(
+                "🔄 Recompute now",
+                key="ord_recompute_now",
+                help="Force a fresh engine rebuild so any recent config "
+                     "changes (supplier settings, freight rules, holiday "
+                     "closures, SKU-supplier assignments) take effect "
+                     "without blocking the page.",
+                width="stretch",
+            ):
+                _started = _start_background_engine_refresh(
+                    "manual ABC refresh requested",
+                    _engine_source_fingerprint())
+                _get_engine_df.clear()
+                st.session_state.pop("_reorder_apply_sig", None)
+                _load_ordering_shared_db_state.clear()
+                if _started:
+                    st.success(
+                        "ABC refresh started in the background. You can "
+                        "keep working; the dashboard will pick up the new "
+                        "engine output when it finishes.")
+                else:
+                    st.info(
+                        "ABC refresh is already running, or could not be "
+                        "started. The dashboard will keep using the last "
+                        "good engine output.")
+
+        _render_ordering_engine_input_freshness()
+
+        # ------------------------------------------------------------------
+        # Glossary — click-to-reveal definitions for every buyer-facing term.
+        # Keep terminology single-sourced here so edits propagate via search.
+        # ------------------------------------------------------------------
+        # 2026-09-18 — glossary and AI chat share one row so the page
+        # opens on the supplier, not on two full-width help panels
+        # (James: "the supplier gets lost in the buzz").
+        _help_col, _ai_col = st.columns(2)
+        with _help_col, st.expander(
+            "📖 How to read this page",
+            expanded=False,
         ):
-            _started = _start_background_engine_refresh(
-                "manual ABC refresh requested",
-                _engine_source_fingerprint())
-            _get_engine_df.clear()
-            st.session_state.pop("_reorder_apply_sig", None)
-            _load_ordering_shared_db_state.clear()
-            if _started:
-                st.success(
-                    "ABC refresh started in the background. You can "
-                    "keep working; the dashboard will pick up the new "
-                    "engine output when it finishes.")
-            else:
-                st.info(
-                    "ABC refresh is already running, or could not be "
-                    "started. The dashboard will keep using the last "
-                    "good engine output.")
+            # v2.67.49 — single-source glossary. Edit at the top of
+            # this file (see GLOSSARY_MARKDOWN). Same content also
+            # renders on the Slow Movers page expander and is
+            # injected into the AI Assistant system prompt.
+            st.markdown(GLOSSARY_MARKDOWN)
 
-    _render_ordering_engine_input_freshness()
+        # ------------------------------------------------------------------
+        # v2.67.359 — inline AI chat for the Ordering page. Reuses the
+        # SAME code path as the Slack bot and the standalone AI Assistant
+        # page via slack_listener._compose_response. One brain, multiple
+        # surfaces — when we tune the system prompt or add a tool, all
+        # three surfaces benefit together. Strategy: see the
+        # strategy_viktor_specialise memory note (James 2026-06-03:
+        # build our own AI intelligence; Viktor retired as Q&A endpoint).
+        # channel_intent="po_review" routes to the reorder-focused system
+        # prompt copy (PO drafts, backorders, stock decisions).
+        # ------------------------------------------------------------------
+        with _ai_col, st.expander(
+            "🤖 Ask the AI about ordering",
+            expanded=False,
+        ):
+            st.caption(
+                "Ask anything about reorders, suppliers, SKUs, lead "
+                "times, the engine, or our processes. The AI has the "
+                "same tools and Notion knowledge-base access as the "
+                "standalone AI Assistant page — answers should match. "
+                "Examples: *why is LED-13.019 suggesting 80?* · "
+                "*what's our process for Topmet weekly orders?* · "
+                "*which Luz Negra SKUs are most over target?*")
+            _ord_ai_key = "_ord_ai_history"
+            if _ord_ai_key not in st.session_state:
+                st.session_state[_ord_ai_key] = []
+            # Render existing conversation (oldest first).
+            for _entry in st.session_state[_ord_ai_key]:
+                with st.chat_message(_entry["role"]):
+                    st.markdown(_entry["content"])
+            # New question.
+            _ord_ai_question = st.chat_input(
+                "Ask about ordering…",
+                key="ord_ai_chat_input")
+            if _ord_ai_question:
+                st.session_state[_ord_ai_key].append({
+                    "role": "user", "content": _ord_ai_question})
+                with st.chat_message("user"):
+                    st.markdown(_ord_ai_question)
+                # Compose via the shared LLM pipeline. po_review intent
+                # gives reorder-focused system prompt copy.
+                try:
+                    import slack_listener as _sl
+                    _user_name = (
+                        (current_user_profile or {}).get("name")
+                        or (current_user_profile or {}).get(
+                            "real_name")
+                        or "buyer")
+                    _msg = {
+                        "text": _ord_ai_question,
+                        "channel_name": "ordering-dashboard",
+                        "user_name": _user_name,
+                        "user_id": (
+                            (current_user_profile or {}).get(
+                                "user_id") or "ordering-page"),
+                        "channel_id": "ordering-dashboard",
+                        "ts": str(datetime.now().timestamp()),
+                        "thread_ts": None,
+                    }
+                    with st.spinner("Thinking…"):
+                        _text, _tools = _sl._compose_response(
+                            _msg,
+                            classification="ordering_question",
+                            channel_intent="po_review",
+                        )
+                except Exception as _ai_exc:  # noqa: BLE001
+                    _text = f"_(AI error: {_ai_exc})_"
+                    _tools = []
+                if not _text or not _text.strip():
+                    _text = (
+                        "_(no response — the AI declined to answer. "
+                        "Try rephrasing the question or be more "
+                        "specific about which SKU/supplier you mean.)_")
+                st.session_state[_ord_ai_key].append({
+                    "role": "assistant", "content": _text})
+                with st.chat_message("assistant"):
+                    st.markdown(_text)
+                if _tools:
+                    st.caption(
+                        "🔧 tools used: " + ", ".join(_tools[:6]))
+            if st.session_state[_ord_ai_key] and st.button(
+                    "🗑 Clear conversation",
+                    key="ord_ai_clear",
+                    help="Reset the chat history for this session."):
+                st.session_state[_ord_ai_key] = []
+                st.rerun()
 
-    # ------------------------------------------------------------------
-    # Glossary — click-to-reveal definitions for every buyer-facing term.
-    # Keep terminology single-sourced here so edits propagate via search.
-    # ------------------------------------------------------------------
-    # 2026-09-18 — glossary and AI chat share one row so the page
-    # opens on the supplier, not on two full-width help panels
-    # (James: "the supplier gets lost in the buzz").
-    _help_col, _ai_col = st.columns(2)
-    with _help_col, st.expander(
-        "📖 How to read this page",
-        expanded=False,
-    ):
-        # v2.67.49 — single-source glossary. Edit at the top of
-        # this file (see GLOSSARY_MARKDOWN). Same content also
-        # renders on the Slow Movers page expander and is
-        # injected into the AI Assistant system prompt.
-        st.markdown(GLOSSARY_MARKDOWN)
-
-    # ------------------------------------------------------------------
-    # v2.67.359 — inline AI chat for the Ordering page. Reuses the
-    # SAME code path as the Slack bot and the standalone AI Assistant
-    # page via slack_listener._compose_response. One brain, multiple
-    # surfaces — when we tune the system prompt or add a tool, all
-    # three surfaces benefit together. Strategy: see the
-    # strategy_viktor_specialise memory note (James 2026-06-03:
-    # build our own AI intelligence; Viktor retired as Q&A endpoint).
-    # channel_intent="po_review" routes to the reorder-focused system
-    # prompt copy (PO drafts, backorders, stock decisions).
-    # ------------------------------------------------------------------
-    with _ai_col, st.expander(
-        "🤖 Ask the AI about ordering",
-        expanded=False,
-    ):
-        st.caption(
-            "Ask anything about reorders, suppliers, SKUs, lead "
-            "times, the engine, or our processes. The AI has the "
-            "same tools and Notion knowledge-base access as the "
-            "standalone AI Assistant page — answers should match. "
-            "Examples: *why is LED-13.019 suggesting 80?* · "
-            "*what's our process for Topmet weekly orders?* · "
-            "*which Luz Negra SKUs are most over target?*")
-        _ord_ai_key = "_ord_ai_history"
-        if _ord_ai_key not in st.session_state:
-            st.session_state[_ord_ai_key] = []
-        # Render existing conversation (oldest first).
-        for _entry in st.session_state[_ord_ai_key]:
-            with st.chat_message(_entry["role"]):
-                st.markdown(_entry["content"])
-        # New question.
-        _ord_ai_question = st.chat_input(
-            "Ask about ordering…",
-            key="ord_ai_chat_input")
-        if _ord_ai_question:
-            st.session_state[_ord_ai_key].append({
-                "role": "user", "content": _ord_ai_question})
-            with st.chat_message("user"):
-                st.markdown(_ord_ai_question)
-            # Compose via the shared LLM pipeline. po_review intent
-            # gives reorder-focused system prompt copy.
-            try:
-                import slack_listener as _sl
-                _user_name = (
-                    (current_user_profile or {}).get("name")
-                    or (current_user_profile or {}).get(
-                        "real_name")
-                    or "buyer")
-                _msg = {
-                    "text": _ord_ai_question,
-                    "channel_name": "ordering-dashboard",
-                    "user_name": _user_name,
-                    "user_id": (
-                        (current_user_profile or {}).get(
-                            "user_id") or "ordering-page"),
-                    "channel_id": "ordering-dashboard",
-                    "ts": str(datetime.now().timestamp()),
-                    "thread_ts": None,
-                }
-                with st.spinner("Thinking…"):
-                    _text, _tools = _sl._compose_response(
-                        _msg,
-                        classification="ordering_question",
-                        channel_intent="po_review",
-                    )
-            except Exception as _ai_exc:  # noqa: BLE001
-                _text = f"_(AI error: {_ai_exc})_"
-                _tools = []
-            if not _text or not _text.strip():
-                _text = (
-                    "_(no response — the AI declined to answer. "
-                    "Try rephrasing the question or be more "
-                    "specific about which SKU/supplier you mean.)_")
-            st.session_state[_ord_ai_key].append({
-                "role": "assistant", "content": _text})
-            with st.chat_message("assistant"):
-                st.markdown(_text)
-            if _tools:
-                st.caption(
-                    "🔧 tools used: " + ", ".join(_tools[:6]))
-        if st.session_state[_ord_ai_key] and st.button(
-                "🗑 Clear conversation",
-                key="ord_ai_clear",
-                help="Reset the chat history for this session."):
-            st.session_state[_ord_ai_key] = []
-            st.rerun()
 
     _ctx = _build_ordering_context()
     engine_df = _ctx.engine_df
@@ -14486,19 +14494,23 @@ elif page == "Ordering":
         sc_row1 = st.columns([3, 2])
     with sc_row1[0]:
         sel_label = st.selectbox(
-            ":clipboard: Draft PO — by supplier",
+            "Supplier",
             dropdown_labels,
             key="ord_supplier_label",
             help="Top 15 by 12-month spend first, then A-Z.",
+            label_visibility="collapsed",
         )
         sel_sup = label_to_supplier[sel_label]
         st.session_state["ordering_active_supplier"] = sel_sup
+        # Supplier becomes the page headline.
+        _title_slot.header(f"🛒 {sel_sup}")
     with sc_row1[1]:
         freight_mode_choice = st.radio(
-            "Freight mode for this PO",
+            "Freight mode",
             ["Mixed (auto per-SKU)", "Sea only", "Air only"],
             index=0,
             horizontal=True,
+            label_visibility="collapsed",
             key=f"freight_mode_{sel_sup}",
             help=(
                 "Mixed: uses whichever freight mode matches each SKU's "
@@ -15334,16 +15346,20 @@ elif page == "Ordering":
         _facts.insert(0,
                       f"stock **{_fmt_money(sw_stock_value)}** vs goal "
                       f"**{_fmt_money(sw_goal_value)}**")
-        st.caption(" · ".join(_facts))
+        # Two $ in one string render as LaTeX in st.caption/markdown and
+        # expander labels — escape them.
+        st.caption(" · ".join(_facts).replace("$", "\\$"))
+        _net_gap = sw_stock_value - sw_goal_value
         _health_label = "📊 Stock health — "
-        if sw_excess_value > 0:
-            _health_label += f"over goal by {_fmt_money(sw_excess_value)}"
-        elif sw_understock_value > 0:
-            _health_label += f"short by {_fmt_money(sw_understock_value)}"
+        if _net_gap > 0:
+            _health_label += f"over goal by {_fmt_money(_net_gap)}"
+        elif _net_gap < 0:
+            _health_label += f"short of goal by {_fmt_money(-_net_gap)}"
         else:
             _health_label += "on goal"
         if sw_dead_value > 0:
             _health_label += f" · dead stock {_fmt_money(sw_dead_value)}"
+        _health_label = _health_label.replace("$", "\\$")
         _health_box = st.expander(_health_label, expanded=False)
     with _health_box:
         _render_stock_health_tiles(
@@ -15359,9 +15375,7 @@ elif page == "Ordering":
                        "live SKU. Same method as Stock Optimisation and the "
                        "Command Centre."))
 
-    # --- Filtered PO summary strip ---
-    st.markdown("---")
-    st.markdown(f"**Filtered view** — {len(s_df):,} SKUs after filters:")
+    # --- Filtered PO summary (one caption line, 2026-09-18) ---
 
     # Pull MOV from supplier config so we can show it alongside PO value
     cfg = supp_configs.get(sel_sup, {})
@@ -15369,45 +15383,18 @@ elif page == "Ordering":
     mov_ccy = cfg.get("mov_currency") or ""
     est_value = float((s_df["reorder_qty"] * s_df["POCost"]).sum())
 
-    sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-    sc1.metric("SKUs shown", len(s_df))
-    sc2.metric("Total reorder units",
-               _fmt_number(int(s_df["reorder_qty"].sum())))
+    _sum_bits = [f"**{len(s_df):,}** SKUs shown",
+                 f"**{_fmt_number(int(s_df['reorder_qty'].sum()))}** units",
+                 f"est. PO **{_fmt_money(est_value)}**"]
     if mov_amt and est_value < mov_amt:
-        gap = mov_amt - est_value
-        sc3.metric(
-            "Est. PO value",
-            _fmt_money(est_value),
-            delta=f"-{_fmt_money(gap)} below MOV",
-            delta_color="inverse",
-            help="reorder_qty × FixedCost. Falls back to AverageCost.")
+        _sum_bits.append(
+            f"MOV {mov_ccy}{_fmt_money(mov_amt)} — "
+            f"**{_fmt_money(mov_amt - est_value)} short**")
     elif mov_amt:
-        over = est_value - mov_amt
-        sc3.metric(
-            "Est. PO value",
-            _fmt_money(est_value),
-            delta=f"+{_fmt_money(over)} above MOV",
-            delta_color="normal",
-            help="reorder_qty × FixedCost. Falls back to AverageCost.")
-    else:
-        sc3.metric("Est. PO value", _fmt_money(est_value),
-                   help="reorder_qty × FixedCost. Falls back to AverageCost.")
-
-    if mov_amt:
-        sc4.metric(
-            "MOV target",
-            f"{mov_ccy}{_fmt_money(mov_amt)}",
-            help=f"{sel_sup}'s minimum order value, configured in "
-                 f"Supplier configuration above.")
-    else:
-        sc4.metric(
-            "MOV target", "—",
-            help="No MOV configured for this supplier. Set it in the "
-                 "Supplier configuration expander above.")
-
-    sc5.metric("Filtered stock value",
-               _fmt_money(float(s_df["OnHandValue"].sum())),
-               help="Stock value of just the SKUs shown after filtering.")
+        _sum_bits.append(f"MOV {mov_ccy}{_fmt_money(mov_amt)} met")
+    _sum_bits.append(
+        f"stock in view {_fmt_money(float(s_df['OnHandValue'].sum()))}")
+    st.caption(" · ".join(_sum_bits).replace("$", "\\$"))
 
     # MOV warning + actionable hint
     # Suppress the warning if there are pending qty edits in the editor
@@ -19414,6 +19401,8 @@ elif page == "Ordering":
             row_trace = _compute_target_and_reorder(
                 row_detail, include_trace=True).get("calc_trace", "")
             st.markdown(row_trace)
+
+    _render_ordering_footer()
 
 
 # ---------------------------------------------------------------------------
