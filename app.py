@@ -10471,7 +10471,7 @@ def _render_stock_health_tiles(*, current, goal, excess, understock,
                                dead, dead_skus, reorder_level=None,
                                reorder_asof=None, scope="all stock",
                                goal_help=None, detail_title=None,
-                               detail_fn=None):
+                               detail_fn=None, detail_inline=False):
     """Four plain tiles + one folded detail panel. Used by the Command
     Centre, Stock Optimisation and every vendor on Ordering so the
     same numbers look the same everywhere (2026-09-04, James: "make
@@ -10522,8 +10522,17 @@ def _render_stock_health_tiles(*, current, goal, excess, understock,
                    "single unit in 12 months but are still on the "
                    "shelf. Their goal is zero, so this is a clearance "
                    "job, not a buying one.")
-    with st.expander(detail_title or "🔍 Detail — what's over, what's "
-                     "short, reorder level", expanded=False):
+    # detail_inline: caller already sits inside an expander (Streamlit
+    # forbids nesting), so render the detail flat under a caption.
+    if detail_inline:
+        _detail_box = st.container()
+        _detail_box.caption(detail_title or "What's over, what's short, "
+                            "reorder level")
+    else:
+        _detail_box = st.expander(
+            detail_title or "🔍 Detail — what's over, what's short, "
+            "reorder level", expanded=False)
+    with _detail_box:
         d1, d2, d3 = st.columns(3)
         d1.metric("Over-stocked items", _fmt_money(excess),
                   help="Added up per SKU: for every item above its goal, "
@@ -14545,14 +14554,19 @@ elif page == "Ordering":
 
     # Drafts live in the bottom section of the supplier card (2026-09-18)
     # so supplier → stock health → working draft reads as one panel.
-    _drafts_row = _card_drafts
+    _active_draft_name = next(
+        (d["name"] for d in _drafts_for_supplier
+         if d["id"] == _active_draft_id), None)
+    _drafts_label = (
+        f"📋 PO draft: **{_active_draft_name}**" if _active_draft_name
+        else "📋 PO draft: engine baseline (no draft)")
+    _drafts_label += f" · {len(_drafts_for_supplier)} active"
+    if _archived_drafts:
+        _drafts_label += f", {len(_archived_drafts)} archived"
+    # 2026-09-18 — collapsed by default; the label carries the state
+    # the buyer needs (which draft is live). Open to switch/create.
+    _drafts_row = _card_drafts.expander(_drafts_label, expanded=False)
     with _drafts_row:
-        st.markdown("---")
-        st.markdown(
-            f"**📋 PO drafts** — {len(_drafts_for_supplier)} active"
-            + (f", {len(_archived_drafts)} archived"
-                if _archived_drafts else ""))
-
         _ds_c1, _ds_c2 = st.columns([3, 2])
         with _ds_c1:
             # Determine default index
@@ -15293,8 +15307,9 @@ elif page == "Ordering":
     )
 
     # Supplier header card body (picker sits in its top row, declared
-    # above). Name in large type, one fact line, then the four standard
-    # stock tiles — replaces the old "supplier-wide snapshot" text.
+    # above). One caption fact line, then the stock tiles folded into
+    # a collapsed expander (2026-09-18: James wants the picker
+    # prominent and everything else opt-in).
     with _card_body:
         _sup_cfg = supp_configs.get(sel_sup, {}) or {}
         _facts = [f"**${spend_by_supplier.get(sel_sup, 0):,.0f}** "
@@ -15316,14 +15331,28 @@ elif page == "Ordering":
             _facts.append(
                 f"min order **{_fmt_money(_sup_cfg.get('mov_amount'))}"
                 f"{(' ' + str(_sup_cfg.get('mov_currency'))) if _sup_cfg.get('mov_currency') else ''}**")
-        st.markdown(f"## {sel_sup}")
-        st.markdown(" · ".join(_facts))
+        _facts.insert(0,
+                      f"stock **{_fmt_money(sw_stock_value)}** vs goal "
+                      f"**{_fmt_money(sw_goal_value)}**")
+        st.caption(" · ".join(_facts))
+        _health_label = "📊 Stock health — "
+        if sw_excess_value > 0:
+            _health_label += f"over goal by {_fmt_money(sw_excess_value)}"
+        elif sw_understock_value > 0:
+            _health_label += f"short by {_fmt_money(sw_understock_value)}"
+        else:
+            _health_label += "on goal"
+        if sw_dead_value > 0:
+            _health_label += f" · dead stock {_fmt_money(sw_dead_value)}"
+        _health_box = st.expander(_health_label, expanded=False)
+    with _health_box:
         _render_stock_health_tiles(
             current=sw_stock_value, goal=sw_goal_value,
             excess=sw_excess_value, understock=sw_understock_value,
             dead=sw_dead_value, dead_skus=_sw_health["dead_sku_count"],
             reorder_level=sw_reorder_level_value,
             scope=f"{sel_sup} products",
+            detail_inline=True,
             goal_help=("How much of this supplier's stock we should be "
                        "holding: days of cover by A/B/C class, never below "
                        "the reorder level, at least one unit/pack of every "
