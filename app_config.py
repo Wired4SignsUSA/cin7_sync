@@ -177,7 +177,7 @@ PAGE_DESCRIPTIONS = {
     "Sales Recent": "Recent sales feed + filters.",
     "Monthly Metrics": "Month-over-month KPI report — commission reference.",
     "Ad-Umpire": "Paid-ads dashboard: Google Ads + GA4 attribution + ROAS.",
-    "Cashflow": "Cash position + forecast, backed by QuickBooks Online.",
+    "Cashflow": "Cash position, payables + 13-week forecast from the W4S Cashflow app.",
     "Purchase Analysis": "PO-side analytics: spend by supplier, lead-time variance.",
     "My Profile": "Edit your profile; admins manage all users.",
     "AI Feedback": "Review past AI answers and team-logged corrections.",
