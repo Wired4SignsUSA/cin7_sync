@@ -71,10 +71,10 @@ def fractional_bulk_order_allowed(supplier_name,
                                   supplier_config: dict | None = None) -> bool:
     """Return whether a bulk roll can be ordered as a decimal quantity.
 
-    Neonica sells 100m rolls by partial-roll quantity in CIN7 PO terms:
-    40m required is ordered as 0.40 of a 100m roll, not rounded to 1.00.
-    Keep that rule explicit so supplier config changes cannot accidentally
-    turn Neonica 100m rolls into full-roll-only buys.
+    James 2026-09-23: partial rolls of strip apply ONLY to Neonica Polska
+    Sp. z o.o. (40m required -> 0.40 of a 100m roll). Every other supplier
+    buys whole rolls, whatever its supplier config says (RULES 2.5.1).
+    ``supplier_config`` is accepted for call-site compatibility only.
     """
     try:
         length_m = float(bulk_length_m or 0)
@@ -82,11 +82,10 @@ def fractional_bulk_order_allowed(supplier_name,
         length_m = 0.0
     if not is_bulk_master or length_m <= 0:
         return False
+    return is_fractional_roll_supplier(supplier_name)
 
+
+def is_fractional_roll_supplier(supplier_name) -> bool:
+    """True for the only supplier that sells partial strip rolls (Neonica)."""
     supplier_key = " ".join(str(supplier_name or "").lower().split())
-    if ("neonica" in supplier_key
-            and abs(length_m - NEONICA_FRACTIONAL_ROLL_METRES) < 0.001):
-        return True
-
-    cfg = supplier_config or {}
-    return bool(cfg.get("allow_fractional_qty", True))
+    return "neonica" in supplier_key

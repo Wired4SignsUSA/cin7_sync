@@ -1357,6 +1357,34 @@ class ReorderMathTests(unittest.TestCase):
         )
 
 
+    def test_partial_rolls_are_neonica_only(self) -> None:
+        # James 2026-09-23: config flag cannot make others fractional.
+        self.assertFalse(fractional_bulk_order_allowed(
+            "Luz Negra (EUR)", True, 100, {"allow_fractional_qty": True}))
+        self.assertFalse(fractional_bulk_order_allowed(
+            "Aero Rubber Company", True, 100, None))
+        self.assertTrue(fractional_bulk_order_allowed(
+            "Neonica Polska Sp. z o.o.", True, 50, None))
+
+
+class BulkRollNameDetectionTests(unittest.TestCase):
+    def test_plain_suffix_roll_confirmed_by_name(self) -> None:
+        from engine.sku_rules import bulk_roll_length_from_sku_and_name as f
+        self.assertEqual(f("LEDRGBFLEX-120-100",
+            "Bright RGB IP20 LED Strip (24V) ~ Verbena Series (100m (328ft))"), 100.0)
+        self.assertEqual(f("LEDRGBFLEXIP68-120-12V-50",
+            "Bright RGB IP68 LED Strip (12V) ~ Verbena Series Waterproof 50m (164ft)"), 50.0)
+
+    def test_model_numbers_are_not_roll_lengths(self) -> None:
+        from engine.sku_rules import bulk_roll_length_from_sku_and_name as f
+        self.assertEqual(f("LEDRGBFLEX-120",
+            "Bright RGB IP20 LED Strip (24V) ~ Verbena Series (5m (16.4ft))"), 0.0)
+        self.assertEqual(f("LED-FL-224-9/L3-927",
+            "Premium White Light LED Strips ~ Platinum Series 2700k"), 0.0)
+        self.assertEqual(f("LEDRGBFLEX-120-0305",
+            "Bright RGB IP20 LED Strip per foot"), 0.0)
+
+
 class StripRollupParsingTests(unittest.TestCase):
     def test_bulk_strip_roll_length_guard_only_allows_buying_rolls(self) -> None:
         self.assertFalse(is_bulk_strip_roll_length(0.3))

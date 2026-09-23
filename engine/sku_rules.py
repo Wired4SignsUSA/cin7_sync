@@ -287,6 +287,30 @@ def is_bulk_strip_roll_length(length_m: float) -> bool:
         return False
 
 
+def bulk_roll_length_from_sku_and_name(sku: str, name: str) -> float:
+    """Roll length (m) for a strip SKU whose suffix is a plain length.
+
+    Catches bulk rolls such as ``LEDRGBFLEX-120-100`` ("... (100m (328ft))")
+    that the strip-family parser skips because their cut children are on a
+    BOM. The product name must state the same length in metres, so model
+    numbers like ``LEDRGBFLEX-120`` (a 5m reel) or ``LED-FL-224-9/L3-927``
+    (colour temperature) are not mistaken for 120m / 927m rolls.
+    Returns 0.0 when not a >=50m roll.
+    """
+    if not _is_strip_sku(sku, name):
+        return 0.0
+    parsed = _parse_strip_base(sku)
+    if not parsed:
+        return 0.0
+    length_m = float(parsed[1] or 0)
+    if length_m < 50.0 or length_m != int(length_m):
+        return 0.0
+    pat = r"(?<![\d.])%d\s*m(?:\b|\s|\))" % int(length_m)
+    if not re.search(pat, str(name or ""), flags=re.IGNORECASE):
+        return 0.0
+    return length_m
+
+
 def parse_pack_purchase_sku(sku: str) -> Optional[tuple[str, int]]:
     """Return ``(base_sku, pack_size)`` for purchase-pack SKUs.
 

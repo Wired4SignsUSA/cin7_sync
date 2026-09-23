@@ -67,6 +67,7 @@ from engine.sku_rules import _parse_length
 from engine.sku_rules import _parse_strip_base
 from engine.sku_rules import _parse_tube_sku
 from engine.sku_rules import is_bulk_strip_roll_length
+from engine.sku_rules import bulk_roll_length_from_sku_and_name
 from engine.sku_rules import parse_pack_purchase_sku
 from engine.sku_rules import parse_sourcing_rule
 from engine.stock_goal import (
@@ -7045,6 +7046,18 @@ def _abc_engine(products: pd.DataFrame,
         _n = int(_m.group(1))
         if _n >= 50:
             bulk_master_lengths[_s_str] = float(_n)
+    # (3) Plain-length suffix + name confirmation (2026-09-23). Rolls like
+    #     LEDRGBFLEX-120-100 "(100m (328ft))" end in "-100" (no "M") and
+    #     their per-foot cut is on a BOM, so passes (1) and (2) missed them
+    #     and they were planned as whole units (Dormant + 1-roll floor).
+    _name_by_sku = (dict(zip(df["SKU"].astype(str), df["Name"].astype(str)))
+                    if "Name" in df.columns else {})
+    for _s_str, _nm in _name_by_sku.items():
+        if bulk_master_lengths.get(_s_str, 0) > 0:
+            continue
+        _len3 = bulk_roll_length_from_sku_and_name(_s_str, _nm)
+        if _len3 >= 50:
+            bulk_master_lengths[_s_str] = _len3
 
     df["bulk_length_m"] = df["SKU"].apply(
         lambda s: float(bulk_master_lengths.get(str(s), 0)))
@@ -9055,9 +9068,9 @@ def _build_ordering_context() -> "SimpleNamespace":
         unfulfilled = float(row.get("unfulfilled") or 0)
         # Fractional ordering — for bulk-roll masters where the supplier
         # accepts decimal quantities (e.g. 0.40 × 100m roll instead of
-        # rounding up to 1 full 100m roll). Neonica's 100m rolls are
-        # explicitly fractional; other suppliers use the supplier-level
-        # `allow_fractional_qty` config flag, defaulting to True.
+        # rounding up to 1 full 100m roll). ONLY Neonica sells partial
+        # rolls (James 2026-09-23, RULES 2.5.1); all other suppliers are
+        # whole rolls.
         is_bulk = bool(row.get("is_bulk_master", False))
         bulk_len_m = float(row.get("bulk_length_m", 0) or 0)
         use_fractional = fractional_bulk_order_allowed(
@@ -9116,6 +9129,13 @@ def _build_ordering_context() -> "SimpleNamespace":
         if use_fractional:
             raw_reorder = round(float(shortfall), 2)
             reorder = round(_snap_to_10m(raw_reorder, bulk_len_m), 2)
+        elif is_bulk and bulk_len_m > 0:
+            # Whole-roll supplier (not Neonica, RULES 2.5.1): once 5m or
+            # more is genuinely needed, buy one whole roll rather than
+            # rounding a 0.4-roll need down to zero.
+            import math as _m_ceil
+            reorder = (int(_m_ceil.ceil(float(shortfall) - 1e-9))
+                       if float(shortfall) * bulk_len_m >= 5.0 else 0)
         else:
             reorder = int(round(shortfall))
 
@@ -16100,7 +16120,7 @@ elif page == "Ordering":
     # — editor_cols then selects / orders what the user wants shown.
     _work = s_df.copy()
     # Order qty preserves fractional values for bulk-master rows
-    # (is_bulk_master=True with allow_fractional_qty supplier flag);
+    # (Neonica bulk rolls; reorder_qty is already whole for others);
     # casts to int for everything else.
     def _order_qty_cast(r):
         if bool(r.get("is_bulk_master", False)):
@@ -16442,8 +16462,9 @@ elif page == "Ordering":
             "Order qty": st.column_config.NumberColumn(
                 "Order qty", min_value=0, step=0.01, format="%.2f",
                 help="Editable order qty. Whole numbers for regular SKUs. "
-                     "Decimals (e.g. 0.40) accepted for bulk-roll masters "
-                     "where the supplier accepts fractional ordering — "
+                     "Decimals (e.g. 0.40) accepted for Neonica bulk-roll "
+                     "masters only (partial rolls; other suppliers are "
+                     "whole rolls) — "
                      "lets you order exactly the metres needed instead "
                      "of rounding up to a full roll."),
             "Line value": st.column_config.NumberColumn(
