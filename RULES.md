@@ -227,6 +227,12 @@ from rolled family demand while keeping an older direct-only Trend label.
 
 The `calc_trace` transparency panel always shows the full breakdown when the flag is non-Stable: who bought, what %, top-2 %, non-top avg.
 
+**3.4.2 Sporadic buying policy (2026-09-23, James).** ABC ranks value, not steadiness, so a ⚡ Sporadic SKU can be A or B (e.g. LEDIRIS3000-180-5m: A on $10k/yr, but monthly 16·0·0·0·2·1·17·0·0·7·2·0). Class defaults over-buy after a spike and still cannot cover the next project order, which is ordered in on lead time anyway. So for every ⚡ Sporadic row (any class; not Project):
+- **Safety %** = the supplier's **class-C** safety %.
+- **Order-up-to** = max(rate-based level, `median_order_qty_12mo`) — the shelf holds one typical order. `median_order_qty_12mo` = median units per sale order (SaleID) over the engine's 12mo direct sale lines. Skipped when the rate is clamped to 0.
+- **Stock goal** = the order-up-to level (no class days-of-cover on top), floored by the typical order and range floor. Before Ordering has computed the reorder level (warm job) the goal uses `SPORADIC_FALLBACK_COVER_DAYS` (30) × planning rate.
+Impact at launch (snapshot 2026-09-23, 120 A/B Sporadic SKUs): reorder $ ≈ unchanged (−$48, 7 qty changes); goal −$10.6k; ~$4.4k existing stock re-labelled excess.
+
 ---
 
 ## 4. Excess / Dead Stock Rules
@@ -250,7 +256,8 @@ per-vendor tiles and daily snapshots agree by construction:
   "Optimum stock value"; do not call it Optimum again.
 - **Stock goal** — per SKU the LARGEST of class days-of-cover × planning rate
   (`DEFAULT_COVER_DAYS`: A 50, B 75, C 150, D 0), the reorder level, and the
-  range floor. Zero for dropship, do-not-reorder, discontinued and non-master
+  range floor. ⚡ Sporadic rows skip the class cover (goal = reorder
+  level / typical order / range floor — §3.4.2). Zero for dropship, do-not-reorder, discontinued and non-master
   rows. Planning rate = unadjusted 12mo rate (`avg_daily_base`), clamped to 0
   when nothing moved in 90 days. Valued at the Ordering `EffectiveUnitCost`
   chain (FIFO/unit → AverageCost → family/category median).

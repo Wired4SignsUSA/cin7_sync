@@ -75,6 +75,9 @@ from engine.stock_goal import (
     compute_stock_goal,
     excess_and_understock,
     goal_units,
+    is_sporadic,
+    sporadic_order_up_to,
+    sporadic_safety_pct,
     planning_avg_daily,
     range_floor_units,
     stock_health_summary,
@@ -247,6 +250,9 @@ background ABC warmer is rebuilding.
   buyers while the year shows 3+ buyers. The engine plans on the **lower**
   of the 12-month and last-6-month rates so one big historic month can't
   drive a reorder by itself; the range floor still holds one unit/pack.
+  Whatever its ABC class it uses the class-C safety %, holds at least one
+  typical order (median 12-month order size), and its stock goal is the
+  order-up-to level with no class days-of-cover on top.
 - **Stable** — sold in at least 4 of the last 6 months. The 12-month rate
   is trusted as a run rate.
 
@@ -5969,8 +5975,19 @@ def _abc_engine(products: pd.DataFrame,
             cust_12mo = float(cust_tot_12.iloc[0]["qty"])
             share_12mo = cust_12mo / total_12mo
             top_name_12mo = str(cust_tot_12.iloc[0]["name"] or "")
+        # 2026-09-23 — typical order size (median units per sale
+        # order over 12mo, direct sales only). ⚡ Sporadic rows hold
+        # at least one typical order on the shelf (engine/stock_goal).
+        median_order = 0.0
+        if "SaleID" in g12.columns:
+            _per_order = (g12.dropna(subset=["SaleID"])
+                          .groupby("SaleID")["Quantity"].sum())
+            _per_order = _per_order[_per_order > 0]
+            if not _per_order.empty:
+                median_order = float(_per_order.median())
         top_info.append({
             "SKU": sku,
+            "median_order_qty_12mo": median_order,
             "top_cust_pct": share1,
             "top_2_cust_pct": share2,
             "non_top_avg_units": non_top_avg,
@@ -5983,7 +6000,8 @@ def _abc_engine(products: pd.DataFrame,
         })
     top_df = (pd.DataFrame(top_info)
                 if top_info else pd.DataFrame(
-                  columns=["SKU", "top_cust_pct", "top_2_cust_pct",
+                  columns=["SKU", "median_order_qty_12mo",
+                            "top_cust_pct", "top_2_cust_pct",
                             "non_top_avg_units",
                             "top_cust_name",
                             "top_cust_units_12mo",
@@ -6002,6 +6020,7 @@ def _abc_engine(products: pd.DataFrame,
     vel["customers_45d"] = vel["customers_45d"].fillna(0).astype(int)
     vel["customers_12mo"] = vel["customers_12mo"].fillna(0).astype(int)
     vel["top_cust_pct"] = vel["top_cust_pct"].fillna(0)
+    vel["median_order_qty_12mo"] = vel["median_order_qty_12mo"].fillna(0)
     vel["top_cust_units_12mo"] = vel["top_cust_units_12mo"].fillna(0)
     vel["top_cust_pct_12mo"] = vel["top_cust_pct_12mo"].fillna(0)
     vel["top_cust_name"] = vel["top_cust_name"].fillna("")
@@ -6237,7 +6256,8 @@ def _abc_engine(products: pd.DataFrame,
               "units_45d", "units_prior_45d", "units_90d",
               "customers_45d", "customers_12mo",
               "top_cust_pct", "top_2_cust_pct", "non_top_avg_units",
-              "top_cust_units_12mo", "top_cust_pct_12mo", "momentum"]:
+              "top_cust_units_12mo", "top_cust_pct_12mo", "momentum",
+              "median_order_qty_12mo"]:
         if c not in df.columns:
             df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
@@ -8829,6 +8849,13 @@ def _build_ordering_context() -> "SimpleNamespace":
             "B": cfg.get("safety_pct_b") or 20.0,
             "C": cfg.get("safety_pct_c") or 15.0,
         }.get(abc, 20.0)
+        # 2026-09-23 (James) — ⚡ Sporadic rows use the class-C safety %
+        # whatever their ABC class, and hold at least one typical order
+        # (median 12mo order size) — RULES 3.4.2.
+        is_sporadic_row = is_sporadic(row.get("trend_flag"))
+        _typical_order = float(row.get("median_order_qty_12mo") or 0)
+        safety_pct = sporadic_safety_pct(
+            safety_pct, cfg.get("safety_pct_c") or 15.0, is_sporadic_row)
         # v2.67.283 — review period = the supplier's ACTUAL reorder
         # cadence when configured (e.g. 7 for a weekly supplier).
         # The ABC-class review_days are only the fallback. Carrying
@@ -8971,6 +8998,14 @@ def _build_ordering_context() -> "SimpleNamespace":
         is_project_row = (str(row.get("trend_flag") or "")
                           == "🎯 Project")
         target_policy_notes = []
+        if is_sporadic_row and not is_project_row:
+            _lifted = sporadic_order_up_to(
+                target, _typical_order, avg_daily, True)
+            if _lifted > target + 1e-9:
+                target_policy_notes.append(
+                    f"⚡ Sporadic: lifted to one typical order "
+                    f"({_typical_order:g} = median 12mo order size)")
+                target = _lifted
         # 2026-09-03 range floor (engine/stock_goal.py). A live SKU
         # that sells fewer than ~10 units/yr used to get a target of
         # 0.2–0.9 units, i.e. "carry nothing", which is how 1,706
@@ -9164,7 +9199,8 @@ def _build_ordering_context() -> "SimpleNamespace":
         # "Overstocked" / "$5 tied up".
         _goal_for_excess = goal_units(
             _plan_rate_for_floor, _abcd_for_floor,
-            reorder_level=target, floor=_range_floor)
+            reorder_level=target, floor=_range_floor,
+            sporadic=is_sporadic_row, typical_order=_typical_order)
         excess_units = excess_units_over_target(
             onhand, _goal_for_excess,
             is_bulk_master=is_bulk,
@@ -9625,7 +9661,10 @@ def _build_ordering_context() -> "SimpleNamespace":
             f"**Lead time**: {lead_time_days} days "
             f"({freight_mode_used}{_freight_rule_note})"
             + lead_time_basis_note
-            + f"**ABC class**: {abc} → safety {safety_pct:.0f}%\n\n"
+            + f"**ABC class**: {abc} → safety {safety_pct:.0f}%"
+            + (" (⚡ Sporadic → class-C safety; goal = order-up-to, "
+               "no class cover)" if is_sporadic_row else "")
+            + "\n\n"
             f"**Review period**: {review_days}d — {review_basis}\n\n"
             f"**Lead-time demand**: {avg_daily:.2f} × {lead_time_days} "
             f"= {lt_demand:.1f} units\n\n"
@@ -15063,6 +15102,10 @@ elif page == "Ordering":
                 "B": cfg_sel.get("safety_pct_b") or 20.0,
                 "C": cfg_sel.get("safety_pct_c") or 15.0,
             }.get(abc, 20.0)
+            _spor_override = is_sporadic(row.get("trend_flag"))
+            safety_pct = sporadic_safety_pct(
+                safety_pct, cfg_sel.get("safety_pct_c") or 15.0,
+                _spor_override)
             review_days = {
                 "A": cfg_sel.get("review_days_a") or 14,
                 "B": cfg_sel.get("review_days_b") or 30,
@@ -15078,6 +15121,10 @@ elif page == "Ordering":
             new_target = lt_demand + safety + review_demand
             is_project_override = (
                 str(row.get("trend_flag") or "") == "🎯 Project")
+            if _spor_override and not is_project_override:
+                new_target = sporadic_order_up_to(
+                    new_target, row.get("median_order_qty_12mo"),
+                    avg_daily, True)
             if not is_project_override:
                 if sku_moq_override > 0 and new_target < sku_moq_override:
                     new_target = sku_moq_override

@@ -24,7 +24,9 @@ So the app now carries THREE clearly named figures, all defined here:
                      plus the range floor below). Drives POs.
 ``goal``           — the stock the business *should* carry:
                      ``max(avg_daily x cover_days[class], reorder_level,
-                     range_floor)``; zero for D-class (no demand),
+                     range_floor)`` (⚡ Sporadic: the reorder level,
+                     no class cover — see SPORADIC_FALLBACK_COVER_DAYS);
+                     zero for D-class (no demand),
                      dropship, discontinued and do-not-reorder SKUs.
 ``excess`` / ``understock`` — always measured against ``goal``.
 
@@ -49,6 +51,21 @@ DEFAULT_COVER_DAYS: dict[str, float] = {"A": 50.0, "B": 75.0, "C": 150.0}
 # Classes that get a range floor of one unit / one pack when they have
 # live demand. D never does.
 _RANGE_FLOOR_CLASSES = ("A", "B", "C")
+
+# 2026-09-23 (James) — ⚡ Sporadic SKUs (lumpy, project-driven demand)
+# must not get A/B class defaults. The class cover days and A/B safety
+# % over-buy after a spike and still cannot cover the next project
+# order (those are ordered in on lead time anyway). Instead:
+#   * safety % = the supplier's class-C safety % (see sporadic_safety_pct);
+#   * order-up-to = max(rate-based level, median order size over 12mo),
+#     so the shelf covers one typical order (sporadic_order_up_to);
+#   * goal = the order-up-to level (no class cover on top), floored by
+#     the range floor and the typical order.
+# When the reorder level is not known yet (warm job / Command Centre
+# before Ordering has run) the goal falls back to this many days of the
+# planning rate — roughly lead time × (1 + safety) + a 14-day cadence
+# on a 12-21 day air lead time.
+SPORADIC_FALLBACK_COVER_DAYS = 30.0
 
 GOAL_COLUMNS = ("ABCD", "planning_avg_daily", "range_floor_units",
                 "goal_units", "goal_value", "unit_cost_for_goal",
@@ -133,13 +150,46 @@ def range_floor_units(planning_daily: float, abcd: str, *,
     return pack if pack >= 1 else 1.0
 
 
+def is_sporadic(trend_flag) -> bool:
+    """True for the ⚡ Sporadic trend label (RULES 3.4)."""
+    return "Sporadic" in str(trend_flag or "")
+
+
+def sporadic_safety_pct(class_safety_pct: float, safety_pct_c: float,
+                        sporadic: bool) -> float:
+    """Safety % for the reorder formula: Sporadic rows use class C."""
+    return _num(safety_pct_c) if sporadic else _num(class_safety_pct)
+
+
+def sporadic_order_up_to(target: float, typical_order: float,
+                         avg_daily: float, sporadic: bool) -> float:
+    """Lift a Sporadic row's order-up-to level to one typical order.
+
+    Only when the SKU still has a live rate — a row clamped to zero
+    (ended project / nothing in 90 days) stays at zero.
+    """
+    t = max(0.0, _num(target))
+    if not sporadic or _num(avg_daily) <= 0:
+        return t
+    return max(t, max(0.0, _num(typical_order)))
+
+
 def goal_units(planning_daily: float, abcd: str, *,
                reorder_level: float = 0.0,
                floor: float = 0.0,
-               cover_days: Mapping[str, float] | None = None) -> float:
+               cover_days: Mapping[str, float] | None = None,
+               sporadic: bool = False,
+               typical_order: float = 0.0) -> float:
     """Units the business should carry for this SKU."""
     if abcd == "D":
         return 0.0
+    if sporadic:
+        rl = max(0.0, _num(reorder_level))
+        if planning_daily <= 0:
+            return max(rl, max(0.0, floor))
+        base = (rl if rl > 0
+                else planning_daily * SPORADIC_FALLBACK_COVER_DAYS)
+        return max(base, max(0.0, _num(typical_order)), max(0.0, floor))
     days = (cover_days or DEFAULT_COVER_DAYS).get(abcd)
     if days is None:
         days = DEFAULT_COVER_DAYS["C"]
@@ -235,6 +285,7 @@ def compute_stock_goal(df: pd.DataFrame, *,
              if "trend_flag" in df.columns
              else pd.Series("", index=df.index))
     skus = df["SKU"].astype(str) if "SKU" in df.columns else pd.Series("", index=df.index)
+    typical = _col("median_order_qty_12mo")
 
     plan, floors, goals, values, costs = [], [], [], [], []
     for i in range(len(df)):
@@ -256,7 +307,9 @@ def compute_stock_goal(df: pd.DataFrame, *,
             gu = goal_units(
                 pd_, abcd,
                 reorder_level=(target.iat[i] if target is not None else 0.0),
-                floor=fl, cover_days=cover_days)
+                floor=fl, cover_days=cover_days,
+                sporadic=is_sporadic(trend.iat[i]),
+                typical_order=typical.iat[i])
         cost = unit_cost_for_goal(onhand.iat[i], ohv.iat[i],
                                   avg_cost.iat[i], fixed_cost.iat[i])
         plan.append(pd_); floors.append(fl); goals.append(gu)

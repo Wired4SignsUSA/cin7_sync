@@ -123,3 +123,68 @@ def test_goal_covers_reorder_level_once_target_present():
     assert g.loc["A1", "goal_units"] == 150
     s = sg.stock_health_summary(df)
     assert s["reorder_level_value"] == 150 * 10 + 0.3 * 10
+
+
+# ---- 2026-09-23 Sporadic tuning (RULES 3.4.2) ----------------------
+
+import pytest  # noqa: E402
+
+from engine.stock_goal import (  # noqa: E402
+    SPORADIC_FALLBACK_COVER_DAYS,
+    compute_stock_goal,
+    goal_units,
+    is_sporadic,
+    sporadic_order_up_to,
+    sporadic_safety_pct,
+)
+
+
+def test_is_sporadic_label():
+    assert is_sporadic("⚡ Sporadic")
+    assert not is_sporadic("Stable")
+    assert not is_sporadic(None)
+
+
+def test_sporadic_uses_class_c_safety():
+    assert sporadic_safety_pct(45, 20, True) == 20
+    assert sporadic_safety_pct(45, 20, False) == 45
+
+
+def test_sporadic_order_up_to_lifts_to_typical_order():
+    assert sporadic_order_up_to(1.4, 3, 0.04, True) == 3
+    assert sporadic_order_up_to(3.9, 2, 0.12, True) == 3.9
+    # not sporadic / no live rate -> unchanged
+    assert sporadic_order_up_to(1.4, 3, 0.04, False) == 1.4
+    assert sporadic_order_up_to(0.0, 3, 0.0, True) == 0.0
+
+
+def test_sporadic_goal_is_reorder_level_not_class_cover():
+    # LEDIRIS3000-180-5m: A-class 50d cover would be 6.16
+    rate = 45 / 365
+    assert goal_units(rate, "A", reorder_level=3.5, floor=1) == pytest.approx(rate * 50)
+    assert goal_units(rate, "A", reorder_level=3.5, floor=1,
+                      sporadic=True, typical_order=2) == pytest.approx(3.5)
+    # typical order and floor still hold
+    assert goal_units(rate, "A", reorder_level=1.5, floor=1,
+                      sporadic=True, typical_order=4) == 4
+    # no reorder level yet (warm job) -> fallback cover days
+    assert goal_units(rate, "B", reorder_level=0, floor=1,
+                      sporadic=True) == pytest.approx(
+                          rate * SPORADIC_FALLBACK_COVER_DAYS)
+    # dead rate -> only floor / reorder level
+    assert goal_units(0.0, "B", reorder_level=0, floor=0,
+                      sporadic=True, typical_order=5) == 0
+    assert goal_units(rate, "D", sporadic=True, typical_order=5) == 0
+
+
+def test_compute_stock_goal_sporadic_row_uses_median_column():
+    df = pd.DataFrame([{
+        "SKU": "X", "ABC": "A", "trend_flag": "⚡ Sporadic",
+        "avg_daily": 45 / 365, "avg_daily_base": 45 / 365,
+        "effective_units_12mo": 45, "effective_units_90d": 9,
+        "_visible_units_12mo": 45, "OnHand": 1, "OnHandValue": 97,
+        "AverageCost": 97, "FixedCost": 87, "target_stock": 3.5,
+        "median_order_qty_12mo": 2,
+    }])
+    out = compute_stock_goal(df)
+    assert out["goal_units"].iat[0] == pytest.approx(3.5)
