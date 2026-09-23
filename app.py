@@ -91,6 +91,7 @@ from engine.reorder_math import (
     excess_units_over_target,
     fractional_bulk_order_allowed,
     normalise_planning_quantity,
+    round_to_pack_nearest,
 )
 from engine.sku_movement_audit import (
     build_sku_current_month_movement,
@@ -9088,11 +9089,16 @@ def _build_ordering_context() -> "SimpleNamespace":
                 target_policy_notes.append(
                     f"SKU MOQ lifts target to {sku_moq:g}")
             if sku_eoq > 0:
-                rounded_target = _ceil_to_multiple(target, sku_eoq)
-                if rounded_target > target + 1e-9:
+                # Nearest pack/roll (James 2026-09-23, RULES 5.7), never
+                # below MOQ or lead-time + safety (+holiday) cover.
+                rounded_target = round_to_pack_nearest(
+                    target, sku_eoq,
+                    min_qty=max(sku_moq,
+                                lt_demand + safety + holiday_cover))
+                if abs(rounded_target - target) > 1e-9:
                     target_policy_notes.append(
                         f"SKU EOQ rounds target to {rounded_target:g} "
-                        f"(multiple of {sku_eoq:g})")
+                        f"(nearest multiple of {sku_eoq:g})")
                     target = rounded_target
             if _range_floor > 0 and target < _range_floor:
                 target = _range_floor
@@ -9241,7 +9247,16 @@ def _build_ordering_context() -> "SimpleNamespace":
                 and (sku_moq > 0 or not use_fractional)):
             reorder = float(moq)
         if reorder > 0 and sku_eoq > 0 and not is_project_row:
-            reorder = _ceil_to_multiple(float(reorder), sku_eoq)
+            # Nearest pack/roll (James 2026-09-23, RULES 5.7). Floor =
+            # MOQ and the lead-time + safety cover still missing, so a
+            # round-down only gives up review-period cover.
+            _cover_floor = max(0.0, normalise_planning_quantity(
+                lt_demand + safety + holiday_cover,
+                is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+                - effective_pos)
+            reorder = round_to_pack_nearest(
+                float(reorder), sku_eoq,
+                min_qty=max(float(moq or 0), _cover_floor))
         if not use_fractional:
             reorder = int(round(float(reorder)))
         elif reorder:
@@ -13794,7 +13809,9 @@ elif page == "Supplier Pricing":
             "defaults when present. Ordering and Product Detail use this "
             "same table, so quick row edits and deeper SKU edits stay in "
             "sync. Legacy Pack qty is kept as a batch multiple for older "
-            "rules; EOQ is the current economic/order batch multiple.")
+            "rules; EOQ is the current batch multiple / roll size; quantities round "
+            "to the nearest multiple, never below MOQ or lead-time + "
+            "safety cover.")
 
         existing_packs = db.all_sku_pack()
         if existing_packs:
@@ -15222,8 +15239,10 @@ elif page == "Ordering":
                 if sku_moq_override > 0 and new_target < sku_moq_override:
                     new_target = sku_moq_override
                 if sku_eoq_override > 0:
-                    new_target = _ceil_to_multiple(
-                        float(new_target), sku_eoq_override)
+                    new_target = round_to_pack_nearest(
+                        float(new_target), sku_eoq_override,
+                        min_qty=max(sku_moq_override,
+                                    lt_demand + safety))
             onhand = float(row.get("OnHand") or 0)
             available = float(row.get("Available") or 0)
             on_order = float(row.get("OnOrder") or 0)
@@ -15248,8 +15267,12 @@ elif page == "Ordering":
                 new_reorder = float(moq)
             if (new_reorder > 0 and sku_eoq_override > 0
                     and not is_project_override):
-                new_reorder = _ceil_to_multiple(
-                    float(new_reorder), sku_eoq_override)
+                _cover_floor = max(0.0, normalise_planning_quantity(
+                    lt_demand + safety, is_bulk_master=is_bulk,
+                    bulk_length_m=bulk_len_m) - effective_pos)
+                new_reorder = round_to_pack_nearest(
+                    float(new_reorder), sku_eoq_override,
+                    min_qty=max(float(moq or 0), _cover_floor))
             new_reorder = (
                 round(float(new_reorder), 2) if use_fractional
                 else int(round(float(new_reorder)))
@@ -19189,7 +19212,9 @@ elif page == "Ordering":
                 if (not is_project
                         and sku_eoq_override > 0
                         and qty > 0):
-                    qty = _ceil_to_multiple(float(qty), sku_eoq_override)
+                    qty = round_to_pack_nearest(
+                        float(qty), sku_eoq_override,
+                        min_qty=float(moq or 0))
                 if use_fractional:
                     return round(float(qty), 2)
                 return int(max(1, _ceil_to_multiple(float(qty), 1.0)))
@@ -22938,8 +22963,9 @@ elif page == "Product Detail":
                 value=float(_pd_sku_eoq or 0),
                 step=1.0,
                 format="%.2f",
-                help="Rounds target and suggested reorder to this multiple "
-                     "except for Project rows.")
+                help="Rounds target and suggested reorder to the NEAREST "
+                     "multiple (e.g. roll size), never to zero or below "
+                     "MOQ / lead-time + safety cover. Not Project rows.")
             pd_note = st.text_input(
                 "Buying note",
                 value=str(_pd_policy.get("note") or ""))

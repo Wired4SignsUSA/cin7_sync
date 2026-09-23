@@ -371,9 +371,15 @@ places.
 - **SKU MOQ** lifts `target_stock` when the computed target is lower, and
   floors suggested reorder quantity when a positive reorder exists. It
   wins over supplier MOQ.
-- **SKU EOQ / batch qty** rounds `target_stock` and suggested reorder up
-  to a clean economic/order batch multiple. Legacy `pack_qty` is used as
-  the batch multiple only when `eoq_qty` is empty.
+- **SKU EOQ / batch qty** (also where buyers enter the roll size of a SKU
+  with no bulk-roll SKU) rounds `target_stock` and suggested reorder to
+  the **nearest** multiple (James, 2026-09-23): halves round up, a
+  positive need never rounds to zero, and a round-down may never leave
+  the order below MOQ or below the lead-time + safety (+ supplier
+  holiday) cover still needed — then it rounds up instead. So only
+  review-period cover is ever given up (60m needed on 50m rolls → 50m if
+  lead-time + safety is covered by 50m, else 100m). Legacy `pack_qty` is
+  used as the batch multiple only when `eoq_qty` is empty.
 - **Project rows are not auto-inflated** by MOQ/EOQ. They stay visible
   for buyer review, but a known project must be manually ordered.
 - Because target stock changes, optimum stock value, excess/slow-stock

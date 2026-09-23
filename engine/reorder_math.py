@@ -89,3 +89,33 @@ def is_fractional_roll_supplier(supplier_name) -> bool:
     """True for the only supplier that sells partial strip rolls (Neonica)."""
     supplier_key = " ".join(str(supplier_name or "").lower().split())
     return "neonica" in supplier_key
+
+
+def round_to_pack_nearest(quantity, pack, *, min_qty=0.0) -> float:
+    """Round a buy quantity to the NEAREST whole pack/roll (RULES 5.7 SKU EOQ).
+
+    James 2026-09-23: roll/pack sizes (SKU EOQ) round to the nearest roll,
+    not always up. Guard rails so rounding down never leaves us short:
+      * halves round up (75m on a 50m roll -> 100m);
+      * a positive need never rounds to zero (at least one pack);
+      * never below ``min_qty`` (MOQ, or the lead-time + safety cover still
+        needed) -- if nearest falls below it, round UP instead.
+    Non-positive quantity or pack returns ``quantity`` unchanged.
+    """
+    import math
+    try:
+        qty = float(quantity or 0)
+        size = float(pack or 0)
+    except (TypeError, ValueError):
+        return quantity
+    if qty <= 0 or size <= 0:
+        return quantity
+    packs = max(1, math.floor(qty / size + 0.5 + 1e-9))
+    rounded = packs * size
+    try:
+        floor_qty = float(min_qty or 0)
+    except (TypeError, ValueError):
+        floor_qty = 0.0
+    if rounded < floor_qty - 1e-9:
+        rounded = math.ceil((floor_qty - 1e-9) / size) * size
+    return float(rounded)
