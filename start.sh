@@ -111,11 +111,52 @@ _supervise() {
     done
 }
 
+# 2026-09-23 — Inngest Phase 2. When the Inngest keys are present (and
+# INNGEST_SYNC is not 0) the nightly sync, boot catch-up and the
+# weekly/monthly extras run as Inngest functions in inngest_sync.py
+# instead of sync_loop.sh. Same commands, same order — see INNGEST.md.
+# Safety net: if inngest_sync.py dies within 2 min of starting three
+# times in a row (bad key, Inngest unreachable), fall back to the bash
+# loop so the night is not lost.
+_use_inngest_sync() {
+    [ "${INNGEST_SYNC:-1}" != "0" ] \
+        && [ -n "${INNGEST_EVENT_KEY:-}" ] \
+        && [ -n "${INNGEST_SIGNING_KEY:-}" ]
+}
+
+_supervise_inngest_sync() {
+    local log="${DATA_DIR:-/data}/output/sync_loop.log"
+    local fast_fails=0
+    local started
+    while true; do
+        started=$(date +%s)
+        python inngest_sync.py >> "$log" 2>&1 || true
+        if [ $(( $(date +%s) - started )) -lt 120 ]; then
+            fast_fails=$((fast_fails + 1))
+        else
+            fast_fails=0
+        fi
+        if [ "$fast_fails" -ge 3 ]; then
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [supervise] inngest_sync" \
+                 "failed 3x at start — falling back to sync_loop.sh" >> "$log"
+            _supervise sync ./sync_loop.sh
+            return
+        fi
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [supervise] inngest_sync" \
+             "exited — restarting in 30s" >> "$log"
+        sleep 30
+    done
+}
+
 # Start sync loops under supervision, in the background.
 # Trap SIGTERM so a clean Render restart kills all processes.
 _supervise nearsync ./nearsync_loop.sh &
 NEARSYNC_PID=$!
-_supervise sync ./sync_loop.sh &
+if _use_inngest_sync; then
+    _supervise_inngest_sync &
+else
+    _supervise sync ./sync_loop.sh &
+fi
 SYNC_PID=$!
 trap "kill $NEARSYNC_PID $SYNC_PID 2>/dev/null || true" EXIT
 

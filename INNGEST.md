@@ -66,9 +66,36 @@ schedule.
   `tests/test_inngest_worker.py` fails if a `_run_bg` name in
   `slack_loop.sh` has no matching entry.
 
-## Not in scope (Phase 2)
+## Phase 2 — web service nightly sync (2026-09-23)
 
-`daily_sync.sh` / `sync_loop.sh` on the web service (21-step nightly
-sync, monthly report, boot-time backfills) — candidate for a step function
-so a CIN7 timeout resumes at the failed step instead of losing the night.
+`inngest_sync.py` (app id `cin7-sync-web`) replaces the scheduling half of
+`sync_loop.sh` on `wired4signs-app`. `start.sh` runs it instead of
+`sync_loop.sh` when the same two keys are set and `INNGEST_SYNC` is not `0`.
+
+| bash (`sync_loop.sh` / `daily_sync.sh`) | Inngest |
+| --- | --- |
+| sleep until `SYNC_HOUR_UTC`, recomputed every boot | `daily_sync` cron `0 {SYNC_HOUR_UTC} * * *` |
+| 21 commands, `\|\| echo FAILED (continuing)` | one step per command; retried once, then recorded in `failed_steps` and the run continues |
+| boot catch-up runs `daily_sync.sh` inline | event `cin7-sync-web/daily_sync.requested` (id `catchup-YYYY-MM-DD`, so repeat deploys = one run) |
+| `verify_critical_csv` → exit 1 | `verify-critical-feeds` step; stale → run marked failed (NonRetriableError) and warm skipped |
+| `_start_warm_engine` (lock, guard, timeout) | `warm-engine` step, same lock/env/timeout; 30-min delay on catch-up runs |
+| Friday / 13th / 15th / 1st blocks + `/data/.last_*` markers | functions on `cin7-sync-web/daily_sync.finished` filtered by date, idempotent per day/month |
+
+* Runs are exclusive (`Singleton(mode="skip")`) — Inngest `Concurrency`
+  limits steps, not runs, so without it two runs interleave.
+* The worker's env-scoped `"cin7"` key is deliberately **not** used: the
+  nightly run is 2–3 h and would starve the worker's CIN7 polls.
+* Extras fire only after scheduled runs (as in bash). The 60-day sale-lines
+  refresh is the 13th only (bash also retried on the 14th if missed); the
+  PDF and Friday email never retry, to avoid double posts.
+* Logs: same `/data/output/daily_sync.log` and `sync_loop.log`.
+* Safety net: if `inngest_sync.py` dies within 2 min three times in a row,
+  `start.sh` falls back to `sync_loop.sh`.
+* Roll back: `INNGEST_SYNC=0`, redeploy the web service.
+* Adding a nightly step: add the command to **both** `daily_sync.sh` and
+  `STEPS`; `tests/test_inngest_sync.py` fails if they differ.
+* Manual run: Inngest → `cin7-sync-web` → `daily_sync` → Invoke, or send
+  `cin7-sync-web/daily_sync.requested` with `{"reason": "extras"}` to also
+  fire the date-matched extras.
+
 `nearsync` stays in bash.
