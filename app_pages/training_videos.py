@@ -27,7 +27,37 @@ VIDEOS: dict[str, dict] = {
     "Ordering": {
         "file": "ordering.mp4",
         "title": "Ordering: build a PO for one vendor",
-        "length": "3½ min",
+        "length": "3 min",
+        "recorded": "2026-09-23",
+    },
+    "Supplier Setup": {
+        "file": "supplier_setup.mp4",
+        "title": "Supplier Setup: lead times, order rules, holidays",
+        "length": "2 min",
+        "recorded": "2026-09-23",
+    },
+    "865FabLab Production": {
+        "file": "fablab_production.mp4",
+        "title": "865FabLab Production: plan and order a corner batch",
+        "length": "2 min",
+        "recorded": "2026-09-23",
+    },
+    "Finishing Work Orders": {
+        "file": "finishing_work_orders.mp4",
+        "title": "Finishing Work Orders: send profiles to All Star",
+        "length": "2 min",
+        "recorded": "2026-09-23",
+    },
+    "Stock Optimisation": {
+        "file": "stock_optimisation.mp4",
+        "title": "Stock Optimisation: stock held vs goal",
+        "length": "1½ min",
+        "recorded": "2026-09-23",
+    },
+    "Slow Movers": {
+        "file": "slow_movers.mp4",
+        "title": "Slow Movers: find and clear stock that isn't selling",
+        "length": "1½ min",
         "recorded": "2026-09-23",
     },
 }

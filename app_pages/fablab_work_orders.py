@@ -482,9 +482,20 @@ def _render_draft_lifecycle(actor: str,
             if did == active_id:
                 default_idx = opts.index(label)
                 break
+    # Keep the picker on the active order when code set it (e.g. "Create
+    # order" just made one). Otherwise the picker keeps its old value
+    # ("No active order") and resets the new order straight away
+    # (2026-09-23, found while recording the training videos).
+    picker_key = f"{k}_draft_picker"
+    if active_id and active_id in opt_to_id.values():
+        if opt_to_id.get(st.session_state.get(picker_key)) != active_id:
+            st.session_state[picker_key] = opts[default_idx]
+    if picker_key in st.session_state and st.session_state[picker_key] not in opts:
+        st.session_state.pop(picker_key)
     picked = st.selectbox(
-        "Active order", opts, index=default_idx,
-        key=f"{k}_draft_picker",
+        "Active order", opts,
+        index=(0 if picker_key in st.session_state else default_idx),
+        key=picker_key,
         help="Pick an existing order, or leave on 'No active order' and "
              "create one from the ticked items below the table.")
     new_id = opt_to_id.get(picked)
