@@ -14732,11 +14732,26 @@ elif page == "Ordering":
                     if did == _active_draft_id:
                         _default_idx = _draft_opts.index(label)
                         break
+            # A just-created draft becomes the active one. Write it into
+            # the picker's own state: the picker otherwise keeps "Engine
+            # baseline" and resets the new draft straight away
+            # (2026-09-23, found while recording the training video).
+            _picker_key = f"po_draft_picker_{sel_sup}"
+            _pending_draft = st.session_state.pop(
+                f"_po_draft_select_{sel_sup}", None)
+            if _pending_draft is not None:
+                for _pl, _pid in _draft_opt_to_id.items():
+                    if _pid == _pending_draft:
+                        st.session_state[_picker_key] = _pl
+                        break
+            if st.session_state.get(_picker_key) not in _draft_opts:
+                st.session_state.pop(_picker_key, None)
             _picked = st.selectbox(
                 "Active draft (qtys you edit save here)",
                 options=_draft_opts,
-                index=_default_idx,
-                key=f"po_draft_picker_{sel_sup}",
+                index=(0 if _picker_key in st.session_state
+                       else _default_idx),
+                key=_picker_key,
                 help="Pick a draft to load its saved qtys into the "
                      "editor below. 'Engine baseline' uses engine "
                      "suggestions only — edits won't be saved unless "
@@ -14771,6 +14786,7 @@ elif page == "Ordering":
                         note=_new_note,
                     )
                     st.session_state[_draft_state_key] = new_id
+                    st.session_state[f"_po_draft_select_{sel_sup}"] = new_id
                     st.success(f"Created draft #{new_id}")
                     st.rerun()
 

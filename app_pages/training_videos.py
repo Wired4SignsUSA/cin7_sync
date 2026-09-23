@@ -24,6 +24,12 @@ VIDEOS: dict[str, dict] = {
         "length": "2½ min",
         "recorded": "2026-09-23",
     },
+    "Ordering": {
+        "file": "ordering.mp4",
+        "title": "Ordering: build a PO for one vendor",
+        "length": "3½ min",
+        "recorded": "2026-09-23",
+    },
 }
 
 _OPEN_KEY = "_training_video_open_{page}"
