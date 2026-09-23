@@ -46,6 +46,7 @@ from app_config import (
     PAGE_GROUPS,
     PAGE_OPTIONS,
 )
+from app_pages.buying_priority import render_buying_priority
 from app_pages.cashflow_viktor import legacy_page_enabled, render_cashflow_viktor
 from app_pages.data_health import render_data_health
 from app_pages.coating_work_orders import render_finishing_work_orders
@@ -2056,7 +2057,11 @@ def _visible_pages_for_profile(profile: dict) -> list[str]:
             p for p in page_options
             if (
                 p != "User Permissions"
-                and db.can_user_access_page(user_id, p, user_role)
+                # Buying Priority is a view onto Ordering: same access.
+                and db.can_user_access_page(
+                    user_id,
+                    "Ordering" if p == "Buying Priority" else p,
+                    user_role)
             )
         ]
     except Exception:
@@ -2442,6 +2447,24 @@ with st.sidebar:
         st.stop()
 
     _default_page = (current_user_profile or {}).get("default_page")
+    # Cross-page jump (e.g. Buying Priority → "Open in Ordering"): a
+    # button callback leaves {"page", "supplier"} in _nav_request. Point
+    # the sidebar at that page by resetting the nav widgets' state so
+    # they re-initialise from _initial_page. The supplier part is
+    # consumed by the Ordering picker.
+    _nav_req = st.session_state.get("_nav_request") or {}
+    _nav_req_page = _nav_req.get("page")
+    if _nav_req_page and _nav_req_page in _visible_pages:
+        st.session_state["_sidebar_selected_page"] = _nav_req_page
+        st.session_state["_default_page_consumed"] = True
+        st.session_state.pop("_sidebar_nav_group", None)
+        for _nk in [k for k in st.session_state.keys()
+                    if str(k).startswith("_sidebar_nav_page_")]:
+            st.session_state.pop(_nk, None)
+        if not _nav_req.get("supplier"):
+            st.session_state.pop("_nav_request", None)
+    elif _nav_req_page:
+        st.session_state.pop("_nav_request", None)
     _previous_page = st.session_state.get("_sidebar_selected_page")
     if (_default_page
             and _default_page in _visible_pages
@@ -14290,6 +14313,10 @@ elif page == "Sales Recent":
 # Page: Ordering — unified ABC-driven reorder workflow
 # ---------------------------------------------------------------------------
 
+elif page == "Buying Priority":
+    _bp_ctx = _build_ordering_context()
+    render_buying_priority(engine_df=_bp_ctx.engine_df, fold_note=_fold_note)
+
 elif page == "Ordering":
     # Title slot: filled with the chosen supplier once the picker has
     # run so the vendor name is the page headline (James 2026-09-18).
@@ -14576,6 +14603,17 @@ elif page == "Ordering":
     dropdown_options = top_15 + remainder
     dropdown_labels = [_label(s) for s in dropdown_options]
     label_to_supplier = dict(zip(dropdown_labels, dropdown_options))
+
+    # Jump from Buying Priority: preselect the requested vendor once.
+    _nav_req = st.session_state.get("_nav_request") or {}
+    if _nav_req.get("page") == "Ordering" and _nav_req.get("supplier"):
+        _want = _nav_req["supplier"]
+        if _want in dropdown_options:
+            st.session_state["ord_supplier_label"] = dropdown_labels[
+                dropdown_options.index(_want)]
+        else:
+            st.warning(f"{_want} has nothing orderable on this page yet.")
+        st.session_state.pop("_nav_request", None)
 
     with _card_head:
         sc_row1 = st.columns([3, 2])

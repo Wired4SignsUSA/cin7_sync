@@ -102,6 +102,7 @@ PAGE_GROUPS = OrderedDict({
         "Data Health",
     ],
     "Buying": [
+        "Buying Priority",
         "Ordering",
         "Stock Optimisation",
         "Finishing Work Orders",
@@ -142,6 +143,10 @@ PAGE_DESCRIPTIONS = {
     "Overview": "High-level KPIs: stock value, sales, slow movers, today vs YoY.",
     "AI Assistant": "Natural-language Q&A grounded in live CIN7 + Shopify data.",
     "Data Health": "Sync freshness, CSV row counts, data integrity flags.",
+    "Buying Priority": (
+        "What to buy across all vendors: uncovered backorders first, "
+        "then reorder priority, with a jump to each vendor on Ordering."
+    ),
     "Ordering": "ABC-driven reorder workbench with PO drafts.",
     "Stock Optimisation": (
         "Business-wide stock $ health: current vs optimum, excess, "

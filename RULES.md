@@ -480,6 +480,21 @@ still execute their body on every rerun, so heavy helper tables should
 not be built until the buyer opens them. Explanatory copy belongs in
 help text or a small closed notes expander inside the opened tool.
 
+**9.11 Buying Priority (Buying › Buying Priority).** One cross-vendor
+list of what to buy, built by `engine/buying_priority.py` from the same
+Ordering-context rows (reorder_qty, Status, cost), master SKUs only,
+do-not-reorder excluded. Tiers: (1) backorder not on a PO —
+`Allocated − OnHand − OnOrder > 0` after bulk-residue normalisation,
+ranked by uncovered-backorder value; (2) "🔴 Reorder now" with
+reorder_qty > 0; (3) other reorder_qty > 0 ("Reorder soon"). Tiers 2–3
+rank A→D class, then fewest days of cover ((Available + OnOrder) /
+avg_daily), then suggested value. Suggested qty = max(reorder_qty,
+uncovered backorder). Discontinued/dropship rows show only via tier 1.
+Vendors rank by most urgent tier, then backorder value, then best item
+rank. "Open in Ordering →" sets `_nav_request`; the sidebar switches page
+and the Ordering picker preselects the vendor. Page access follows the
+user's Ordering permission.
+
 ---
 
 ## 10. Data Backup & Recovery Rules
