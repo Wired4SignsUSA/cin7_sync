@@ -47,6 +47,8 @@ from app_config import (
     PAGE_OPTIONS,
 )
 from app_pages.buying_priority import render_buying_priority
+from app_pages.training_videos import render_sidebar_list as _render_training_sidebar
+from app_pages.training_videos import render_training_button
 from app_pages.cashflow_viktor import legacy_page_enabled, render_cashflow_viktor
 from app_pages.data_health import render_data_health
 from app_pages.coating_work_orders import render_finishing_work_orders
@@ -2457,10 +2459,14 @@ with st.sidebar:
     if _nav_req_page and _nav_req_page in _visible_pages:
         st.session_state["_sidebar_selected_page"] = _nav_req_page
         st.session_state["_default_page_consumed"] = True
-        st.session_state.pop("_sidebar_nav_group", None)
-        for _nk in [k for k in st.session_state.keys()
-                    if str(k).startswith("_sidebar_nav_page_")]:
-            st.session_state.pop(_nk, None)
+        # Write the target into the nav widgets' own state. Popping the
+        # keys is not enough: the browser keeps the old radio value and
+        # the sidebar kept showing the previous page (2026-09-23).
+        _nav_req_group = PAGE_GROUP_BY_NAME.get(_nav_req_page)
+        if _nav_req_group:
+            st.session_state["_sidebar_nav_group"] = _nav_req_group
+            st.session_state[f"_sidebar_nav_page_{_nav_req_group}"] = (
+                _nav_req_page)
         if not _nav_req.get("supplier"):
             st.session_state.pop("_nav_request", None)
     elif _nav_req_page:
@@ -2485,10 +2491,15 @@ with st.sidebar:
     _group_index = (
         _visible_groups.index(_initial_group)
         if _initial_group in _visible_groups else 0)
+    if st.session_state.get("_sidebar_nav_group") not in _visible_groups:
+        st.session_state.pop("_sidebar_nav_group", None)
     _nav_group = st.selectbox(
         "Section",
         options=_visible_groups,
-        index=_group_index,
+        # index is ignored once the key holds state; pass 0 then so
+        # Streamlit does not warn about value + session-state together.
+        index=(0 if "_sidebar_nav_group" in st.session_state
+               else _group_index),
         key="_sidebar_nav_group",
     )
     _group_pages = [
@@ -2498,14 +2509,19 @@ with st.sidebar:
     _page_index = (
         _group_pages.index(_initial_page)
         if _initial_page in _group_pages else 0)
+    _page_key = f"_sidebar_nav_page_{_nav_group}"
+    if st.session_state.get(_page_key) not in _group_pages:
+        st.session_state.pop(_page_key, None)
     page = st.radio(
         "Page",
         _group_pages,
-        index=_page_index,
-        key=f"_sidebar_nav_page_{_nav_group}",
+        index=(0 if _page_key in st.session_state else _page_index),
+        key=_page_key,
     )
     st.session_state["_sidebar_selected_page"] = page
     st.caption(PAGE_DESCRIPTIONS.get(page, ""))
+    # Narrated walkthroughs (James 2026-09-23) — one click from anywhere.
+    _render_training_sidebar(_visible_pages)
 
     with st.expander("All pages", expanded=False):
         for _group, _pages in PAGE_GROUPS.items():
@@ -10678,6 +10694,9 @@ def _render_stock_health_tiles(*, current, goal, excess, understock,
             detail_fn()
     return c1, c2, c3, c4
 
+
+# Training video toggle for pages that have one (app_pages/training_videos.py).
+render_training_button(page)
 
 if page == "Overview":
     st.header(":bar_chart: Overview")

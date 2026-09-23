@@ -495,6 +495,17 @@ rank. "Open in Ordering →" sets `_nav_request`; the sidebar switches page
 and the Ordering picker preselects the vendor. Page access follows the
 user's Ordering permission.
 
+**9.12 Training videos.** Narrated screen recordings (captions burned in)
+live in `training_videos/` and are registered in
+`app_pages/training_videos.py` `VIDEOS` (page → file). A page with a
+video shows a "🎓 Training video" toggle at the top; the video only loads
+when switched on (lazy, per 9.10). The sidebar "🎓 Training videos" list
+jumps to the page and opens its video. Videos are served via `st.video`
+so they stay behind the app login. Re-record a page's video when its
+layout changes. Cross-page jumps write the target into the sidebar nav
+widget keys (`_sidebar_nav_group`, `_sidebar_nav_page_<group>`) so the
+sidebar shows the new page.
+
 ---
 
 ## 10. Data Backup & Recovery Rules
