@@ -516,6 +516,19 @@ sidebar shows the new page.
 
 ## 10. Data Backup & Recovery Rules
 
+**9.13 Mobile page (Command Center › Mobile).** Phone-sized, read-only
+view; phones (iPhone/Android user agent, not iPad) open on it at first
+load. Tabs render one at a time (segmented control): Buy = Buying
+Priority rows as vendor cards; SKU = one engine row (available, on PO,
+goal, suggested buy, lead time, cover) + open PO lines via
+`ai_tools.get_incoming_stock`; Approve = Cin7 POs with Status ORDERING /
+OrderStatus DRAFT from the newest purchases_last_* headers (links open
+Cin7 to authorise — the app never authorises) + app po_drafts still
+'editing'; Metrics = headline rows of the published Monthly Metrics
+JSON, current month-to-date vs prior month. Access: Buy/SKU/Approve
+follow Ordering permission, Metrics follows Monthly Metrics. Helpers in
+`engine/mobile_summary.py`; no new math.
+
 **10.1 team_actions.db stays local.** SQLite + cloud sync (GDrive / Dropbox / OneDrive) = database corruption. Never put this file in a live-synced folder. Use a nightly copy to GDrive backups as safety.
 
 **10.2 Source code lives in Git.** Not GDrive. Private GitHub repo. `.gitignore` excludes `.env`, `.venv/`, `output/*.csv`, `team_actions.db`, `.checkpoints/`.

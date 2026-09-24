@@ -100,6 +100,7 @@ PAGE_GROUPS = OrderedDict({
         "Overview",
         "AI Assistant",
         "Data Health",
+        "Mobile",
     ],
     "Buying": [
         "Buying Priority",
@@ -143,6 +144,10 @@ PAGE_DESCRIPTIONS = {
     "Overview": "High-level KPIs: stock value, sales, slow movers, today vs YoY.",
     "AI Assistant": "Natural-language Q&A grounded in live CIN7 + Shopify data.",
     "Data Health": "Sync freshness, CSV row counts, data integrity flags.",
+    "Mobile": (
+        "Phone view: what to buy, SKU lookup, draft POs to authorise, "
+        "headline monthly metrics."
+    ),
     "Buying Priority": (
         "What to buy across all vendors: uncovered backorders first, "
         "then reorder priority, with a jump to each vendor on Ordering."

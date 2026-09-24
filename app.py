@@ -47,6 +47,7 @@ from app_config import (
     PAGE_OPTIONS,
 )
 from app_pages.buying_priority import render_buying_priority
+from app_pages.mobile import is_mobile_user_agent, render_mobile
 from app_pages.training_videos import render_sidebar_list as _render_training_sidebar
 from app_pages.training_videos import render_training_button
 from app_pages.cashflow_viktor import legacy_page_enabled, render_cashflow_viktor
@@ -2042,6 +2043,27 @@ def _clear_app_caches_for_sidebar() -> None:
     st.session_state.pop("_engine_df_cached", None)
 
 
+def _mobile_access(user_id, user_role) -> dict:
+    """Mobile page = a view onto Ordering (Buy/SKU/Approve tabs) and
+    Monthly Metrics (Metrics tab): it inherits those permissions."""
+    def _can(page):
+        try:
+            return bool(db.can_user_access_page(user_id, page, user_role))
+        except Exception:  # noqa: BLE001
+            return True
+    buy = _can("Ordering")
+    metrics = _can("Monthly Metrics")
+    return {"buy": buy, "metrics": metrics, "any": buy or metrics}
+
+
+def _is_phone_request() -> bool:
+    try:
+        return is_mobile_user_agent(
+            st.context.headers.get("User-Agent", "") or "")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _visible_pages_for_profile(profile: dict) -> list[str]:
     page_options = list(PAGE_OPTIONS)
     user_role = (profile or {}).get("role") or "sales"
@@ -2061,10 +2083,14 @@ def _visible_pages_for_profile(profile: dict) -> list[str]:
             if (
                 p != "User Permissions"
                 # Buying Priority is a view onto Ordering: same access.
-                and db.can_user_access_page(
-                    user_id,
-                    "Ordering" if p == "Buying Priority" else p,
-                    user_role)
+                and (
+                    _mobile_access(user_id, user_role)["any"]
+                    if p == "Mobile"
+                    else db.can_user_access_page(
+                        user_id,
+                        "Ordering" if p == "Buying Priority" else p,
+                        user_role)
+                )
             )
         ]
     except Exception:
@@ -2473,6 +2499,11 @@ with st.sidebar:
     elif _nav_req_page:
         st.session_state.pop("_nav_request", None)
     _previous_page = st.session_state.get("_sidebar_selected_page")
+    # Phones open on the Mobile page (first load of the session only).
+    if ("Mobile" in _visible_pages
+            and not st.session_state.get("_default_page_consumed")
+            and _is_phone_request()):
+        _default_page = "Mobile"
     if (_default_page
             and _default_page in _visible_pages
             and not st.session_state.get("_default_page_consumed")):
@@ -14348,6 +14379,68 @@ elif page == "Sales Recent":
 # ---------------------------------------------------------------------------
 # Page: Ordering — unified ABC-driven reorder workflow
 # ---------------------------------------------------------------------------
+
+elif page == "Mobile":
+    _mob_uid = (current_user_profile or {}).get("user_id") or 0
+    _mob_role = (current_user_profile or {}).get("role") or "sales"
+    _mob_name = ((current_user_profile or {}).get("display_name")
+                 or st.session_state.get("current_user", ""))
+    if db.is_super_admin(_mob_name, _mob_role) or (
+            (_mob_role or "").strip().lower() == "admin"):
+        _mob_acc = {"buy": True, "metrics": True}
+    else:
+        _mob_acc = _mobile_access(_mob_uid, _mob_role)
+
+    def _mob_engine_df():
+        return _build_ordering_context().engine_df
+
+    def _mob_open_po(sku):
+        import ai_tools
+        try:
+            ai_tools.set_purchase_lines(purchase_lines)
+            return ai_tools.get_incoming_stock(
+                _mob_engine_df(), sale_lines, {"sku": sku, "limit": 8})
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _mob_cin7_drafts():
+        from engine.mobile_summary import (
+            draft_purchase_orders, latest_purchase_headers)
+        frames = [load(p) for p in (
+            "purchases_last_30d", "purchases_last_3d", "purchases_last_1d")]
+        return draft_purchase_orders(latest_purchase_headers(frames))
+
+    def _mob_local_drafts():
+        try:
+            return [dict(r) for r in db.list_po_drafts()]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _mob_metrics():
+        from engine.mobile_summary import decode_payload
+        try:
+            mm = decode_payload(
+                db.get_dataset_file_payload("monthly_metrics.json"))
+        except Exception:  # noqa: BLE001
+            mm = None
+        if mm is None:  # fall back to the newest local export
+            _p = sorted(OUTPUT_DIR.glob("monthly_metrics_2*.json"))
+            if _p:
+                mm = decode_payload(_p[-1].read_bytes())
+        return mm
+
+    render_mobile(
+        engine_df_fn=_mob_engine_df,
+        image_lookup=lambda: _product_image_lookup_cached(
+            _product_image_fingerprint()),
+        open_po_lines=_mob_open_po,
+        cin7_drafts_fn=_mob_cin7_drafts,
+        local_drafts_fn=_mob_local_drafts,
+        metrics_fn=_mob_metrics,
+        can_buy=_mob_acc["buy"],
+        can_metrics=_mob_acc["metrics"],
+        visible_pages=_visible_pages,
+    )
 
 elif page == "Buying Priority":
     _bp_ctx = _build_ordering_context()
