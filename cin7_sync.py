@@ -1527,6 +1527,78 @@ def sync_movements(client: Cin7Client, days: int) -> None:
     sync_stocktransfers(client, days)
 
 
+class _AssemblyDetailCache:
+    """TaskID -> {k: list-row key, c: CompletionDate, s: Status,
+    t: cached-at epoch, pl: trimmed PickLines}. Stored as one JSON file
+    next to the outputs. Disable with CIN7_ASSEMBLY_DETAIL_CACHE=0."""
+
+    PICK_FIELDS = ("ProductID", "ProductCode", "Name", "Quantity", "Unit",
+                   "Cost", "BinID", "Bin")
+    PRUNE_DAYS = 800
+
+    def __init__(self, path: Path, data: Dict[str, Any], enabled: bool,
+                 ttl_s: float) -> None:
+        self.path, self.data, self.enabled, self.ttl_s = path, data, enabled, ttl_s
+        self.dirty = False
+
+    @classmethod
+    def load(cls) -> "_AssemblyDetailCache":
+        enabled = os.environ.get("CIN7_ASSEMBLY_DETAIL_CACHE", "1") != "0"
+        ttl_days = float(os.environ.get("CIN7_ASSEMBLY_CACHE_TTL_DAYS", "14") or 14)
+        path = OUTPUT_DIR / ".assembly_detail_cache.json"
+        data: Dict[str, Any] = {}
+        if enabled and path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8")) or {}
+            except Exception as exc:  # noqa: BLE001
+                log.warning("  assembly detail cache unreadable (%s); starting empty", exc)
+                data = {}
+        if enabled:
+            log.info("  Assembly detail cache: %d task(s) cached.", len(data))
+        return cls(path, data, enabled, ttl_days * 86400)
+
+    @staticmethod
+    def key(task: Dict[str, Any]) -> str:
+        return (f"{task.get('Date')}|{task.get('Quantity')}|"
+                f"{task.get('ProductCode')}")
+
+    def get(self, tid: str, key: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        ent = self.data.get(tid)
+        if isinstance(ent, dict) and ent.get("k") == key:
+            return ent
+        return None
+
+    def put(self, tid: str, key: str, detail: Dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        pls = detail.get("PickLines") or []
+        if not isinstance(pls, list):
+            return
+        self.data[tid] = {
+            "k": key, "c": detail.get("CompletionDate"),
+            "s": detail.get("Status"), "t": time.time(),
+            "pl": [{f: pl.get(f) for f in self.PICK_FIELDS}
+                   for pl in pls if isinstance(pl, dict)],
+        }
+        self.dirty = True
+
+    def save(self) -> None:
+        if not (self.enabled and self.dirty):
+            return
+        cutoff = time.time() - self.PRUNE_DAYS * 86400
+        self.data = {k: v for k, v in self.data.items()
+                     if float(v.get("t", 0)) >= cutoff}
+        tmp = self.path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(self.data, default=str), encoding="utf-8")
+            os.replace(tmp, self.path)
+            self.dirty = False
+        except OSError as exc:
+            log.warning("  assembly detail cache save failed: %s", exc)
+
+
 def sync_assemblies(client: "Cin7Client", days: int) -> None:
     """Pull completed Finished Goods (FG-XXXX) tasks for the last N days
     and flatten per-component pick-line consumption into a CSV.
@@ -1692,6 +1764,16 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
             log.warning("assembly_component_consumption upsert failed "
                         "(continuing, CSV output is unaffected): %s", exc)
 
+    # 2026-09-24 — per-task detail cache. The 30d pull re-fetched every
+    # completed task in a ~210-day candidate window (~10k detail calls,
+    # ~7 h at 2.5 s/call) every night, although a COMPLETED task's pick
+    # lines never change. Cached tasks are reused; only new tasks (and
+    # in-window entries older than the TTL) hit CIN7. The list-row key
+    # (Date|Quantity|ProductCode) forces a refetch if a task was edited.
+    cache = _AssemblyDetailCache.load()
+    cache_hits = cache_fetches = 0
+    now_ts = time.time()
+
     for i, task in enumerate(tasks, 1):
         tid = task.get("TaskID")
         if not tid:
@@ -1699,16 +1781,35 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
         tid_s = str(tid)
         if tid_s in processed_ids:
             continue
-        try:
-            detail = client.get("finishedGoods", params={"TaskID": tid})
-        except Exception as exc:  # noqa: BLE001
-            detail_errors += 1
-            log.warning("  finishedGoods detail %s failed: %s",
-                        task.get("AssemblyNumber"), exc)
-            if detail_errors > 50:
-                log.error("Too many detail errors; aborting assembly sync.")
-                break
-            continue
+        ckey = _AssemblyDetailCache.key(task)
+        ent = cache.get(tid_s, ckey)
+        detail = None
+        if ent is not None:
+            c_dt = _parse_dt(ent.get("c"))
+            if c_dt is not None and c_dt < cutoff:
+                # Completed before the window: completion dates don't move.
+                processed_ids.add(tid_s)
+                cache_hits += 1
+                continue
+            if now_ts - float(ent.get("t", 0)) < cache.ttl_s:
+                detail = {"PickLines": ent.get("pl") or [],
+                          "CompletionDate": ent.get("c"),
+                          "Status": ent.get("s")}
+                cache_hits += 1
+        if detail is None:
+            try:
+                detail = client.get("finishedGoods", params={"TaskID": tid})
+            except Exception as exc:  # noqa: BLE001
+                detail_errors += 1
+                log.warning("  finishedGoods detail %s failed: %s",
+                            task.get("AssemblyNumber"), exc)
+                if detail_errors > 50:
+                    log.error("Too many detail errors; aborting assembly sync.")
+                    break
+                continue
+            cache_fetches += 1
+            if isinstance(detail, dict):
+                cache.put(tid_s, ckey, detail)
 
         if not isinstance(detail, dict):
             continue
@@ -1763,15 +1864,18 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
                      len(processed_ids), len(rows))
             write_outputs(f"assemblies_last_{days}d", rows)
             _share_new_rows()
+            cache.save()
             _save_checkpoint(ckpt_name, {
                 "processed_ids": sorted(processed_ids),
             })
             flushed_at = len(processed_ids)
 
-    log.info("  Final write: %d component-consumption rows from %d tasks.",
-             len(rows), len(processed_ids))
+    log.info("  Final write: %d component-consumption rows from %d tasks "
+             "(detail cache: %d hits, %d CIN7 fetches).",
+             len(rows), len(processed_ids), cache_hits, cache_fetches)
     write_outputs(f"assemblies_last_{days}d", rows)
     _share_new_rows()
+    cache.save()
     _clear_checkpoint(ckpt_name)
 
     # v2.67.xxx — keep the shared table bounded. Cheap (indexed range

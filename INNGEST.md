@@ -99,3 +99,23 @@ schedule.
   fire the date-matched extras.
 
 `nearsync` stays in bash.
+
+### Detached steps (2026-09-24)
+
+The first cron run (2026-09-24) died with `request_duration_too_long`:
+Inngest caps one step request at a few hours (~3 h observed) and that
+error ends the whole run, not just the step. Every nightly/extra command
+now runs detached: `<step>-start` launches it (`launch_job`, own
+session, exit code written to `/data/output/inngest_jobs/<job>.rc`),
+then `<step>-wait-N` sleeps (15 s → 5 min → 10 min) and `<step>-poll-N`
+reads the result. A job launched by a previous container (redeploy) is
+"lost" and relaunched once (`-retry1`); CIN7 checkpoints resume it.
+`INNGEST_SYNC_STEP_TIMEOUT_S` (5 h) is now a real kill timeout.
+
+Root cause of the long night: `cin7_sync.py assemblies --days 30`
+re-fetched every completed FG task in a ~210-day candidate window
+(~10k detail calls, ~7 h). It now caches task details in
+`/data/output/.assembly_detail_cache.json` (key Date|Quantity|ProductCode,
+14-day TTL for in-window tasks; `CIN7_ASSEMBLY_DETAIL_CACHE=0` disables).
+The first run after deploy warms the cache (still ~7 h); later runs
+fetch only new tasks.

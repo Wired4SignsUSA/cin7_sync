@@ -43,7 +43,10 @@ import shlex
 import socket
 import subprocess
 import sys
+import signal
+import time
 import typing
+import uuid
 
 import inngest
 
@@ -59,6 +62,18 @@ DAILY_CRON = f"0 {SYNC_HOUR_UTC} * * *"
 EV_REQUESTED = "cin7-sync-web/daily_sync.requested"
 EV_FINISHED = "cin7-sync-web/daily_sync.finished"
 
+# Inngest ends the WHOLE run with `request_duration_too_long` when one
+# step's request runs past the platform cap (~3 h observed 2026-09-24,
+# assemblies-30d). So every sync command runs DETACHED: a short "start"
+# step launches it, then sleep + short "poll" steps wait for its exit
+# code. No single step request lasts more than a few seconds.
+JOBS_DIR = OUTPUT_DIR / "inngest_jobs"
+INSTANCE_ID = uuid.uuid4().hex          # new per process: a job launched by a
+                                        # previous container is dead after a redeploy
+POLL_SCHEDULE_S = (15, 30, 60, 120, 300)
+POLL_SLOW_S = 600                       # after POLL_SLOW_AFTER polls
+POLL_SLOW_AFTER = 20
+JOB_ATTEMPTS = 2                        # = one retry, like the old step retries=1
 STEP_TIMEOUT_S = int(os.environ.get("INNGEST_SYNC_STEP_TIMEOUT_S", str(5 * 3600)))
 CRITICAL_MAX_AGE_H = int(os.environ.get("DAILY_SYNC_CRITICAL_MAX_AGE_HOURS", "30"))
 CATCHUP_STALE_H = int(os.environ.get("SYNC_CATCHUP_STALE_HOURS", "20"))
@@ -193,6 +208,167 @@ def run_cmd(name: str, cmd: str, timeout_s: int = STEP_TIMEOUT_S,
     return {"rc": 0, "seconds": secs, "stdout_tail": tail, "stderr_tail": err_tail}
 
 
+# ---------------------------------------------------------------------------
+# Detached jobs (see JOBS_DIR note above)
+# ---------------------------------------------------------------------------
+def _job_paths(job_id: str) -> dict[str, pathlib.Path]:
+    base = JOBS_DIR / job_id
+    return {"meta": base.with_suffix(".json"), "out": base.with_suffix(".out"),
+            "rc": base.with_suffix(".rc")}
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # A zombie child counts as exited.
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            return fh.read().split(")")[-1].split()[0] != "Z"
+    except OSError:
+        return True
+
+
+def _cleanup_old_jobs(max_age_days: int = 7) -> None:
+    cutoff = time.time() - max_age_days * 86400
+    for f in glob.glob(str(JOBS_DIR / "*")):
+        try:
+            if os.path.getmtime(f) < cutoff:
+                os.remove(f)
+        except OSError:
+            pass
+
+
+def launch_job(job_id: str, name: str, cmd: str,
+               timeout_s: int = STEP_TIMEOUT_S,
+               log_path: str | None = None,
+               extra_env: dict[str, str] | None = None) -> dict[str, typing.Any]:
+    """Start `cmd` in its own session and return at once. The shell
+    writes the exit code to <job>.rc when the command ends."""
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_old_jobs()
+    paths = _job_paths(job_id)
+    # Idempotent: if Inngest re-sends this start step (lost response),
+    # don't launch a second copy of a job that is still running here.
+    try:
+        prev = __import__("json").loads(paths["meta"].read_text(encoding="utf-8"))
+        if prev.get("instance") == INSTANCE_ID and not paths["rc"].exists() \
+                and _pid_alive(int(prev["pid"])):
+            return {"job_id": job_id, "pid": prev["pid"], "reused": True}
+    except (OSError, ValueError, KeyError):
+        pass
+    for p in paths.values():
+        p.unlink(missing_ok=True)
+    real = re.sub(r"(^|&&\s*|=\S+\s+)python\s",
+                  lambda m: f"{m.group(1)}{shlex.quote(sys.executable)} ", cmd)
+    wrapped = (f"( {real} ) > {shlex.quote(str(paths['out']))} 2>&1; "
+               f"echo $? > {shlex.quote(str(paths['rc']))}.tmp && "
+               f"mv {shlex.quote(str(paths['rc']))}.tmp {shlex.quote(str(paths['rc']))}")
+    env = {**os.environ, "DATA_DIR": str(DATA_DIR), **(extra_env or {})}
+    _log(f"{name}: {real}  [detached job {job_id}]", pathlib.Path(log_path) if log_path else DAILY_LOG)
+    proc = subprocess.Popen(["bash", "-c", wrapped], cwd=REPO_DIR, env=env,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    meta = {"job_id": job_id, "name": name, "pid": proc.pid, "instance": INSTANCE_ID,
+            "started": time.time(), "timeout_s": timeout_s,
+            "log_path": log_path or str(DAILY_LOG)}
+    paths["meta"].write_text(__import__("json").dumps(meta), encoding="utf-8")
+    return {"job_id": job_id, "pid": proc.pid}
+
+
+def _finish_job(meta: dict[str, typing.Any], paths: dict[str, pathlib.Path],
+                state: str, rc: int | None, note: str = "") -> dict[str, typing.Any]:
+    log_path = pathlib.Path(meta.get("log_path") or DAILY_LOG)
+    name = meta.get("name", meta.get("job_id", "?"))
+    try:
+        out = paths["out"].read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        out = ""
+    if out:
+        _append(log_path, out)
+    secs = round(time.time() - float(meta.get("started", time.time())))
+    if state == "done":
+        _log(f"{name} done in {secs}s", log_path)
+    else:
+        _log(f"{name} FAILED ({state}{' rc=' + str(rc) if rc is not None else ''}"
+             f"{'; ' + note if note else ''}) after {secs}s", log_path)
+    return {"state": state, "rc": rc, "seconds": secs, "note": note,
+            "stdout_tail": out[-1500:]}
+
+
+def poll_job(job_id: str) -> dict[str, typing.Any]:
+    """Never raises. state: running | done | failed | lost | timeout."""
+    import json
+    paths = _job_paths(job_id)
+    try:
+        meta = json.loads(paths["meta"].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"state": "lost", "rc": None, "seconds": 0,
+                "note": "job metadata missing", "stdout_tail": ""}
+    if paths["rc"].exists():
+        try:
+            rc = int(paths["rc"].read_text().strip() or "1")
+        except ValueError:
+            rc = 1
+        return _finish_job(meta, paths, "done" if rc == 0 else "failed", rc)
+    if meta.get("instance") != INSTANCE_ID:
+        return _finish_job(meta, paths, "lost", None,
+                           "service restarted while the job ran")
+    pid = int(meta["pid"])
+    if not _pid_alive(pid):
+        return _finish_job(meta, paths, "lost", None, "process exited without an exit code")
+    if time.time() - float(meta["started"]) > float(meta["timeout_s"]):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        return _finish_job(meta, paths, "timeout", None,
+                           f"killed after {meta['timeout_s']}s")
+    return {"state": "running", "seconds": round(time.time() - float(meta["started"]))}
+
+
+def poll_delay(n: int) -> dt.timedelta:
+    if n >= POLL_SLOW_AFTER:
+        return dt.timedelta(seconds=POLL_SLOW_S)
+    return dt.timedelta(seconds=POLL_SCHEDULE_S[min(n, len(POLL_SCHEDULE_S) - 1)])
+
+
+class JobFailed(Exception):
+    """A detached command failed on every attempt."""
+
+
+def run_detached(ctx: typing.Any, step_id: str, cmd: str,
+                 timeout_s: int = STEP_TIMEOUT_S,
+                 log_path: pathlib.Path | None = None,
+                 extra_env: dict[str, str] | None = None,
+                 attempts: int = JOB_ATTEMPTS) -> dict[str, typing.Any]:
+    """Launch + poll `cmd` with short Inngest steps. Returns the final
+    poll result; raises JobFailed after `attempts` failed attempts.
+    Deterministic on replay: the loop only depends on memoized results."""
+    last: dict[str, typing.Any] = {}
+    for attempt in range(1, attempts + 1):
+        sid = step_id if attempt == 1 else f"{step_id}-retry{attempt - 1}"
+        job_id = f"{ctx.run_id}-{sid}"
+        ctx.step.run(f"{sid}-start", launch_job, job_id, step_id, cmd, timeout_s,
+                     str(log_path) if log_path else None, extra_env)
+        n = 0
+        while True:
+            ctx.step.sleep(f"{sid}-wait-{n}", poll_delay(n))
+            last = ctx.step.run(f"{sid}-poll-{n}", poll_job, job_id)
+            n += 1
+            if last.get("state") != "running":
+                break
+        if last.get("state") == "done":
+            return last
+    raise JobFailed(f"{step_id} {last.get('state')}"
+                    f"{' rc=' + str(last['rc']) if last.get('rc') is not None else ''}"
+                    f"{': ' + last['note'] if last.get('note') else ''}"
+                    f" | {str(last.get('stdout_tail', ''))[-300:]}")
+
+
 def feed_ages_hours() -> dict[str, float | None]:
     """Age in hours of the freshest file for each critical feed (None = missing)."""
     now = dt.datetime.now().timestamp()
@@ -275,12 +451,12 @@ def daily_sync(ctx: inngest.ContextSync) -> dict[str, typing.Any]:
             results[step.id] = {"skipped": skip}
             continue
         try:
-            out = ctx.step.run(step.id, run_cmd, step.id, step.cmd)
+            out = run_detached(ctx, step.id, step.cmd)
             results[step.id] = {"rc": 0, "seconds": out["seconds"]}
-        except inngest.StepError as exc:
-            # Retries exhausted: record and continue, like daily_sync.sh.
+        except (JobFailed, inngest.StepError) as exc:
+            # Attempts exhausted: record and continue, like daily_sync.sh.
             failed.append(step.id)
-            results[step.id] = {"failed": exc.message[:300]}
+            results[step.id] = {"failed": str(exc)[:300]}
 
     ages = ctx.step.run("verify-critical-feeds", feed_ages_hours)
     critical = stale_feeds(ages, CRITICAL_MAX_AGE_H)
@@ -342,8 +518,11 @@ def make_extra_handler(extra: Extra) -> typing.Callable[[inngest.ContextSync], t
     def handler(ctx: inngest.ContextSync) -> typing.Any:
         out: dict[str, typing.Any] = {}
         for step_id, cmd in extra.cmds:
-            out[step_id] = ctx.step.run(step_id, run_cmd, step_id, cmd,
-                                        STEP_TIMEOUT_S, LOOP_LOG)
+            try:
+                out[step_id] = run_detached(ctx, step_id, cmd, STEP_TIMEOUT_S,
+                                            LOOP_LOG, attempts=extra.retries + 1)
+            except JobFailed as exc:
+                raise inngest.NonRetriableError(str(exc)[:500]) from exc
         return out
 
     handler.__name__ = f"extra_{extra.id}"

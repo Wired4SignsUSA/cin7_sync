@@ -152,14 +152,22 @@ class DailySyncFlowTests(unittest.TestCase):
     def _run(self, event, fail=()):
         calls = []
 
-        def fake_run_cmd(name, cmd, *a, **kw):
+        jobs = {}
+
+        def fake_launch(job_id, name, cmd, *a, **kw):
             calls.append(name)
-            if name in fail:
-                raise isync.StepFailed(f"{name} exited 1")
-            return {"rc": 0, "seconds": 1, "stdout_tail": "", "stderr_tail": ""}
+            jobs[job_id] = name
+            return {"job_id": job_id, "pid": 1}
+
+        def fake_poll(job_id):
+            if jobs[job_id] in fail:
+                return {"state": "failed", "rc": 1, "seconds": 1, "note": "",
+                        "stdout_tail": ""}
+            return {"state": "done", "rc": 0, "seconds": 1, "stdout_tail": ""}
 
         ctx = FakeCtx(event)
-        with mock.patch.object(isync, "run_cmd", side_effect=fake_run_cmd), \
+        with mock.patch.object(isync, "launch_job", side_effect=fake_launch), \
+             mock.patch.object(isync, "poll_job", side_effect=fake_poll), \
              mock.patch.object(isync, "warm_engine",
                                return_value={"rc": 0, "seconds": 1}) as warm:
             try:
@@ -191,9 +199,17 @@ class DailySyncFlowTests(unittest.TestCase):
         ctx, calls, warm, res, err = self._run(
             inngest.Event(name=isync.EV_REQUESTED, data={"reason": "catch-up"}))
         self.assertIsNone(err)
-        self.assertEqual(ctx.step.slept, ["warm-boot-delay"])
+        self.assertEqual([x for x in ctx.step.slept if "-wait-" not in x],
+                         ["warm-boot-delay"])
         self.assertEqual(ctx.step.sent, [])
         warm.assert_called_once()
+
+    def test_failed_step_retried_once(self):
+        self._fresh_feeds()
+        ctx, calls, warm, res, err = self._run(
+            inngest.Event(name="inngest/scheduled.timer"), fail={"cin7-boms"})
+        self.assertEqual(calls.count("cin7-boms"), 2)
+        self.assertIn("cin7-boms-retry1-start", ctx.step.ran)
 
     def test_catchup_event_only_when_stale(self):
         self.assertIsNotNone(isync.catchup_event())
@@ -221,6 +237,67 @@ class RunCmdTests(unittest.TestCase):
             with self.assertRaises(isync.StepFailed):
                 isync.run_cmd("t", "python -c 'raise SystemExit(3)'", 60,
                               Path(tmp) / "l.log")
+
+
+class DetachedJobTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.p = mock.patch.object(isync, "JOBS_DIR", Path(self.tmp.name) / "jobs")
+        self.p.start()
+        self.log = Path(self.tmp.name) / "l.log"
+
+    def tearDown(self):
+        self.p.stop()
+        self.tmp.cleanup()
+
+    def _wait(self, job_id, limit=20):
+        import time as _t
+        for _ in range(limit * 10):
+            st = isync.poll_job(job_id)
+            if st["state"] != "running":
+                return st
+            _t.sleep(0.1)
+        return st
+
+    def test_success_and_output_logged(self):
+        isync.launch_job("j1", "t", "FOO=1 python -c 'import os;print(os.environ[\"FOO\"]*3)'",
+                         60, str(self.log))
+        st = self._wait("j1")
+        self.assertEqual(st["state"], "done")
+        self.assertIn("111", self.log.read_text())
+        self.assertIn("t done", self.log.read_text())
+
+    def test_failure_rc(self):
+        isync.launch_job("j2", "t", "python -c 'raise SystemExit(3)'", 60, str(self.log))
+        st = self._wait("j2")
+        self.assertEqual((st["state"], st["rc"]), ("failed", 3))
+
+    def test_timeout_kills(self):
+        isync.launch_job("j3", "t", "sleep 30", 0, str(self.log))
+        import time as _t; _t.sleep(0.3)
+        self.assertEqual(isync.poll_job("j3")["state"], "timeout")
+
+    def test_other_instance_is_lost(self):
+        isync.launch_job("j4", "t", "sleep 30", 60, str(self.log))
+        with mock.patch.object(isync, "INSTANCE_ID", "other"):
+            self.assertEqual(isync.poll_job("j4")["state"], "lost")
+        isync.poll_job  # cleanup: kill
+        import json as _j, signal as _s
+        pid = _j.loads((isync.JOBS_DIR / "j4.json").read_text())["pid"]
+        os.killpg(pid, _s.SIGTERM)
+
+    def test_relaunch_while_running_is_idempotent(self):
+        a = isync.launch_job("j5", "t", "sleep 30", 60, str(self.log))
+        b = isync.launch_job("j5", "t", "sleep 30", 60, str(self.log))
+        self.assertEqual(a["pid"], b["pid"])
+        self.assertTrue(b.get("reused"))
+        import signal as _s
+        os.killpg(a["pid"], _s.SIGTERM)
+
+    def test_poll_delay_backs_off(self):
+        self.assertEqual(isync.poll_delay(0).total_seconds(), 15)
+        self.assertEqual(isync.poll_delay(10).total_seconds(), 300)
+        self.assertEqual(isync.poll_delay(50).total_seconds(), isync.POLL_SLOW_S)
 
 
 class StartShHandoffTests(unittest.TestCase):
