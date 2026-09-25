@@ -265,6 +265,17 @@ CREATE TABLE IF NOT EXISTS ip_lead_times (
 CREATE INDEX IF NOT EXISTS idx_ip_lead_times_vendor
     ON ip_lead_times(vendor_name);
 
+-- 2026-09-25 (RULES 9.15) — stock-out episodes from Inventory
+-- Planner stockouts_hist. Replaced wholesale by ip_stockouts.py.
+CREATE TABLE IF NOT EXISTS ip_stockout_events (
+    sku        TEXT NOT NULL,
+    out_date   TEXT NOT NULL,
+    back_date  TEXT,
+    synced_at  TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ip_stockout_events_sku
+    ON ip_stockout_events(sku);
+
 -- v2.67.292 — QuickBooks Online Profit & Loss data by month.
 -- The Monthly Metrics page treats CIN7-derived figures as
 -- "operational" and QB account values as canonical, because the
@@ -4370,6 +4381,21 @@ _PG_POST_CUTOVER_TABLES = [
       CREATE INDEX IF NOT EXISTS idx_ip_lead_times_vendor
           ON ip_lead_times(vendor_name);
       """),
+    # 2026-09-25 (RULES 9.15) — IP stock-out episodes.
+    ("ip_stockout_events_table",
+      """
+      CREATE TABLE IF NOT EXISTS ip_stockout_events (
+          sku        TEXT NOT NULL,
+          out_date   TEXT NOT NULL,
+          back_date  TEXT,
+          synced_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    ("ip_stockout_events_index",
+      """
+      CREATE INDEX IF NOT EXISTS idx_ip_stockout_events_sku
+          ON ip_stockout_events(sku);
+      """),
     # v2.67.292 — QBO Profit & Loss by month + account-mapping
     # config. Canonical financial source for Monthly Metrics.
     ("qbo_monthly_pl_table",
@@ -5937,6 +5963,38 @@ def get_ip_lead_times() -> dict:
         rows = c.execute(
             "SELECT * FROM ip_lead_times").fetchall()
     return {r["sku"]: dict(r) for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# IP stock-out episodes (2026-09-25, RULES 9.15)
+# ---------------------------------------------------------------------------
+def replace_ip_stockout_events(rows: list) -> int:
+    """Replace the whole table with [(sku, out_date, back_date|None)].
+    One transaction, so readers never see a half-written table."""
+    rows = [(str(s), str(o), (str(b) if b else None)) for s, o, b in rows]
+    with connect() as c:
+        # Both backends run autocommit; wrap delete+insert explicitly.
+        c.execute("BEGIN")
+        try:
+            c.execute("DELETE FROM ip_stockout_events")
+            if rows:
+                c.executemany(
+                    "INSERT INTO ip_stockout_events "
+                    "(sku, out_date, back_date) VALUES (?, ?, ?)", rows)
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+    return len(rows)
+
+
+def list_ip_stockout_events() -> list:
+    """[{sku, out_date, back_date, synced_at}] — all stored episodes."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT sku, out_date, back_date, synced_at "
+            "FROM ip_stockout_events").fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------

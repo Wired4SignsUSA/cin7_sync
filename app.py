@@ -8485,6 +8485,37 @@ def _clear_engine_df_cache() -> None:
 _get_engine_df.clear = _clear_engine_df_cache  # type: ignore[attr-defined]
 
 
+# RULES 9.15 — IP stock-out history x customer orders. Cached per hour
+# and per sale-lines / engine snapshot. Returns (per-SKU summary, hits).
+@st.cache_data(show_spinner=False, max_entries=2)
+def _stockout_frames_cached(sale_fp: tuple, engine_mtime, hour: int):
+    from app_pages import stockout_data as _sod
+    from engine import stockouts as _so
+    events = _sod.load_events()
+    eng = _get_engine_df()
+    try:
+        ds = _zero_goal_sku_set(products)["dropship"]
+    except Exception:  # noqa: BLE001
+        ds = set()
+    elig = _so.eligible_skus(eng, ds)
+    hits = _so.orders_hit(sale_lines, events, elig)
+    return _so.summarise_12mo(events, hits=hits, eligible=elig), hits
+
+
+def _stockout_frames():
+    import time as _t
+    return _stockout_frames_cached(
+        _dir_fingerprint("sale_lines_last_*d_*.csv"),
+        _engine_output_mtime(), int(_t.time() // 3600))
+
+
+try:
+    from app_pages import stockout_data as _sod_reg
+    _sod_reg.set_summary_provider(lambda: _stockout_frames()[0])
+except Exception:  # noqa: BLE001
+    pass
+
+
 # v2.67.xxx -- hotfix: these five names used to live inside the Ordering
 # page's own top-level script code, where Draft PO's helper functions
 # (defined later in the SAME flat elif-block scope) could see them via
@@ -15742,6 +15773,7 @@ elif page == "Ordering":
         "Include?", "Image", "🔍", "SKU", "Name", "ABC", "Status", "Category",
         "trend_flag", "trend_evidence",
         "trend_12m", "last_6mo_series", "last_12mo_series", "units_12mo",
+        "stockouts_12mo",
         "units_45d", "momentum", "customers_45d", "top_cust_pct",
         "avg_daily", "avg_month", "recent_avg_mo", "LengthMM",
         "OnHand", "Allocated", "Available", "OnOrder",
@@ -15800,6 +15832,7 @@ elif page == "Ordering":
         ("sku_eoq_qty", "sku_moq"),
         ("recent_avg_mo", "avg_month"),
         ("trend_evidence", "trend_flag"),
+        ("stockouts_12mo", "last_12mo_series"),  # RULES 9.15
     ]
     for _new, _after in _NEWLY_INTRODUCED_COLS:
         if _new not in editor_cols and _new in default_editor_cols:
@@ -15825,6 +15858,7 @@ elif page == "Ordering":
         "last_6mo_series": "Last 6 months (trend numbers)",
         "last_12mo_series": "Last 12 months (trend numbers)",
         "units_12mo": "12mo units sold",
+        "stockouts_12mo": "Stock-outs 12 mo (count, days out, orders hit)",
         "avg_daily": "Avg daily units",
         "avg_month": "Avg/month (engine velocity)",
         "recent_avg_mo": "Recent avg/mo (last 6mo ÷ active months)",
@@ -15869,7 +15903,7 @@ elif page == "Ordering":
         "Buyer essentials (default)": [
             "Include?", "Image", "SKU", "Name", "ABC", "Status",
             "trend_flag", "trend_evidence", "last_6mo_series",
-            "last_12mo_series",
+            "last_12mo_series", "stockouts_12mo",
             "avg_month", "recent_avg_mo",
             "OnHand", "Available", "OnOrder", "unfulfilled",
             "target_stock", "reorder_qty", "freight_mode",
@@ -16509,6 +16543,12 @@ elif page == "Ordering":
 
     # Defensive: only pick columns actually present in _work (handles new
     # columns added to layouts before they exist in the engine output).
+    # RULES 9.15 — IP stock-out history per SKU (count, days, orders hit).
+    try:
+        from app_pages import stockout_data as _so_data
+        _work = _so_data.attach(_work, label_col="stockouts_12mo")
+    except Exception:  # noqa: BLE001 — never block Ordering on this
+        _work["stockouts_12mo"] = ""
     _safe_cols = [c for c in editor_cols if c in _work.columns]
     if not _safe_cols:
         _safe_cols = list(default_editor_cols)
@@ -16608,6 +16648,11 @@ elif page == "Ordering":
                               ignore_index=True)
     else:
         editable = editable_auto
+    if extras_list and "stockouts_12mo" in editable.columns:
+        try:
+            editable = _so_data.attach(editable, label_col="stockouts_12mo")
+        except Exception:  # noqa: BLE001
+            pass
 
     for _policy_col in (
         "sku_lead_time_days", "sku_moq", "sku_eoq_qty"
@@ -16684,6 +16729,15 @@ elif page == "Ordering":
                 width="small",
                 y_min=0,
             ),
+            "stockouts_12mo": st.column_config.TextColumn(
+                "Stock-outs 12 mo",
+                help="Last 12 months: times this SKU ran out of stock, "
+                     "total days out in brackets, then customer orders "
+                     "placed while it was out (could not ship at once). "
+                     "'· out now' = still out. Dropship and made-to-order "
+                     "kits excluded. Source: Inventory Planner daily "
+                     "stock history, refreshed each morning.",
+                disabled=True, width="small"),
             "last_6mo_series": st.column_config.TextColumn(
                 "Last 6 months",
                 help="Units sold in each of the last 6 calendar months — "
@@ -22229,6 +22283,29 @@ elif page == "Monthly Metrics":
                 mode="lines+markers", line=dict(color="#2f6fed", width=3),
                 hovertemplate="%{x}<br>Stock value $%{y:,.0f}"
                               "<extra></extra>"))
+            # RULES 9.15 — red line: customer orders placed while an
+            # item on them was out of stock (IP history; dropship and
+            # made-to-order kits excluded). Right-hand axis.
+            _so_hits_ok = False
+            try:
+                from engine.stockouts import monthly_order_hits as _moh
+                _so_by_m = _moh(_stockout_frames()[1], sale_lines,
+                                list(months))
+                _so_vals = [_so_by_m[m][0] for m in months]
+                _so_pct = [(_so_by_m[m][0] / _so_by_m[m][1] * 100)
+                           if _so_by_m[m][1] else 0 for m in months]
+                if any(_so_vals):
+                    fig.add_trace(go.Scatter(
+                        x=xs, y=_so_vals, name="Orders hit by a stock-out",
+                        mode="lines+markers", yaxis="y2",
+                        line=dict(color="#d62728", width=2.5),
+                        customdata=_so_pct,
+                        hovertemplate="%{x}<br>%{y:,} orders hit by a "
+                                      "stock-out (%{customdata:.1f}% of "
+                                      "orders)<extra></extra>"))
+                    _so_hits_ok = True
+            except Exception:  # noqa: BLE001 — chart still renders
+                _so_hits_ok = False
             if _goal_now:
                 fig.add_hline(
                     y=_goal_now, line_dash="dash", line_color="#3aa76d",
@@ -22244,6 +22321,11 @@ elif page == "Monthly Metrics":
                            rangemode="tozero"),
                 legend=dict(orientation="h", yanchor="top", y=-0.15, x=0),
             )
+            if _so_hits_ok:
+                fig.update_layout(yaxis2=dict(
+                    title="Orders hit", overlaying="y", side="right",
+                    rangemode="tozero", showgrid=False,
+                    color="#d62728"))
             st.markdown("**Stock optimisation progress**")
             st.plotly_chart(fig, width="stretch",
                             config={"displayModeBar": False})
@@ -22252,8 +22334,13 @@ elif page == "Monthly Metrics":
                 "2026; earlier months modelled, as in the Avg Inventory "
                 "Value row). Green dashed line = current suggested stock "
                 "goal. Bars = slow and dead stock, shown from the month "
-                "they were first recorded. Progress = the blue line "
-                "falling to the green line while the bars shrink.")
+                "they were first recorded. Red line (right axis) = customer "
+                "orders placed while an item on them was out of stock, so "
+                "they could not ship at once (Inventory Planner stock "
+                "history; dropship and made-to-order kits excluded; hover "
+                "for % of orders). Progress = the blue line falling to the "
+                "green line while the bars shrink and the red line stays "
+                "flat or falls.")
 
         _seen_sections: list = []
         for section in _section_order:

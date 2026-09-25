@@ -1009,6 +1009,15 @@ def render_fablab_work_orders(
     planner_df = planner_df.drop(
         columns=["Backorder", "Last 6 months", "Below min demand"],
         errors="ignore")
+    # RULES 9.15 — stock-outs in the last 12 months, beside WIP ref.
+    try:
+        from app_pages import stockout_data as _sod
+        planner_df = _sod.attach(planner_df)
+        _c = [c for c in planner_df.columns if c != _sod.COLUMN_LABEL]
+        _at = _c.index("WIP ref") + 1 if "WIP ref" in _c else len(_c)
+        planner_df = planner_df[_c[:_at] + [_sod.COLUMN_LABEL] + _c[_at:]]
+    except Exception:  # noqa: BLE001 — never block the planner
+        pass
     if planner_df.empty:
         st.warning("No data for flagged SKUs.")
         return
@@ -1075,6 +1084,11 @@ def render_fablab_work_orders(
                      "not yet marked done in Slack). Counted as covered."),
             "WIP ref": st.column_config.TextColumn(
                 "WIP ref", help="Assembly / order the WIP belongs to."),
+            "Stock-outs 12 mo": st.column_config.TextColumn(
+                "Stock-outs 12 mo", width="small",
+                help="Last 12 months: times out of stock, days out in "
+                     "brackets, customer orders placed while out. "
+                     "Source: Inventory Planner stock history."),
             "Monthly demand": st.column_config.NumberColumn(format="%.2f"),
             "Suggested batch": st.column_config.NumberColumn(
                 format="%d", help="Target + open SO − on hand − WIP, rounded up to "

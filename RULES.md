@@ -538,6 +538,19 @@ the current order. The table shows "Last 6 months" (same monthly numbers
 as Ordering) and "Backorder" (engine `unfulfilled`). 865FabLab corners
 are unchanged.
 
+**9.15 Stock-out history (James, 2026-09-25).** Source: Inventory
+Planner `stockouts_hist` (day-level out / back-in transitions), pulled
+daily by `ip_stockouts.py` into `ip_stockout_events`. "Stock-outs 12 mo"
+on Ordering, Finishing and 865FabLab corners reads `N (Dd) · O orders`:
+stock-outs started in the last 12 months, days out, and customer orders
+placed while the SKU was out (could not ship at once). An order counts
+only if the stock-out began before the order day (floor; the order that
+took the last unit is not counted). Dropship SKUs and made-to-order
+assemblies (BOM, no stock goal) are excluded; quotes, credits, voids and
+service sales are not orders. Monthly Metrics' Stock optimisation
+progress chart draws the monthly count of orders hit as a red line
+(right axis, hover = % of all orders). Maths: `engine/stockouts.py`.
+
 **10.1 team_actions.db stays local.** SQLite + cloud sync (GDrive / Dropbox / OneDrive) = database corruption. Never put this file in a live-synced folder. Use a nightly copy to GDrive backups as safety.
 
 **10.2 Source code lives in Git.** Not GDrive. Private GitHub repo. `.gitignore` excludes `.env`, `.venv/`, `output/*.csv`, `team_actions.db`, `.checkpoints/`.

@@ -396,6 +396,7 @@ last_notion_pull_epoch=0   # v2.67.254 Notion playbook pull
 last_notion_push_epoch=0   # v2.67.254 Notion slow-movers push
 last_notion_dims_epoch=0   # v2.67.281 Notion product-dimensions pull
 last_ip_lead_times_epoch=0 # v2.67.285 IP observed lead-times pull
+last_ip_stockouts_epoch=0 # RULES 9.15 IP stock-out history (daily)
 last_qbo_pl_epoch=0        # v2.67.292 QBO Profit & Loss pull
 last_shopify_disc_epoch=0  # v2.67.303 Shopify monthly discounts
 last_si_morning_epoch=0    # v2.67.144 stock-issue morning summary
@@ -856,6 +857,16 @@ while true; do
         last_ip_lead_times_epoch=$(date -u +%s)
         _run_bg "ip_lead_times_sync" \
             "python ip_lead_times.py sync"
+    fi
+
+    # RULES 9.15 IP stock-out history. Daily; feeds "Stock-outs 12 mo".
+    seconds_since_ip_so=$(( now_epoch - last_ip_stockouts_epoch ))
+    if [ "$seconds_since_ip_so" -ge 86400 ] \
+            && [ -n "${IP_API_KEY:-}" ] \
+            && [ -n "${IP_ACCOUNT:-}" ]; then
+        last_ip_stockouts_epoch=$(date -u +%s)
+        _run_bg "ip_stockouts_sync" \
+            "python ip_stockouts.py sync"
     fi
 
     # v2.67.292 QBO Profit & Loss by month. Daily. Pulls the last

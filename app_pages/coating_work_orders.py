@@ -226,6 +226,11 @@ def render_finishing_work_orders(
     extra = pd.DataFrame([finishing_columns(s, bom_parents, product_map)
                           for s in planner_df["SKU"]], index=planner_df.index)
     planner_df = pd.concat([planner_df, extra], axis=1)
+    try:  # RULES 9.15 — stock-outs in the last 12 months
+        from app_pages import stockout_data as _sod
+        planner_df = _sod.attach(planner_df)
+    except Exception:  # noqa: BLE001
+        pass
 
     remembered: dict = st.session_state.get("finishing_ticked", {})
     planner_df["Batch qty"] = [
@@ -237,7 +242,7 @@ def render_finishing_work_orders(
         for sku, sug in zip(planner_df["SKU"], planner_df["Suggested batch"])]
     order = ["Include", "SKU", "Name", "Process", "Colour", "ABC", "Status",
              "On hand", "Open SO", "Backorder", "WIP", "WIP ref", "Last 6 months",
-             "Monthly demand", "Suggested batch",
+             "Stock-outs 12 mo", "Monthly demand", "Suggested batch",
              "Batch qty", "Raw profile", "Buildable from stock", "Materials status",
              "Materials", "Service (BOM)", "Auto-assembly"]
     # Slow sellers (< 1/mo) drop off unless something is owed or in hand.
@@ -305,6 +310,11 @@ def render_finishing_work_orders(
                      "oldest on the left, current month on the right. "
                      "Same numbers as the Ordering page.",
                 width="medium"),
+            "Stock-outs 12 mo": st.column_config.TextColumn(
+                "Stock-outs 12 mo", width="small",
+                help="Last 12 months: times out of stock, days out in "
+                     "brackets, customer orders placed while out. "
+                     "Source: Inventory Planner stock history."),
             "Monthly demand": st.column_config.NumberColumn(format="%.2f"),
             "Suggested batch": st.column_config.NumberColumn(
                 format="%d", help="Target + open SO − on hand − WIP, whole units. "
