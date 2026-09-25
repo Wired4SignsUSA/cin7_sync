@@ -104,7 +104,8 @@ def abcd_class(abc, visible_units_12mo) -> str:
 
 
 def planning_avg_daily(avg_daily, effective_units_12mo,
-                       effective_units_90d, avg_daily_base=None) -> float:
+                       effective_units_90d, avg_daily_base=None,
+                       trend_flag=None) -> float:
     """Daily rate used for goal / range-floor math.
 
     The engine's ``avg_daily`` is hard-zeroed for *dormant* SKUs
@@ -118,9 +119,18 @@ def planning_avg_daily(avg_daily, effective_units_12mo,
     * clamp to 0 when the SKU had 12-month demand but NOTHING in the
       last 90 days (ended project / genuinely stopped) — the same
       clamp the Ordering page applies.
+    * 📈 Trend rows (2026-09-25, James — stock-outs): use the HIGHER of
+      the 12-month rate and the engine's trend-adjusted ``avg_daily``.
+      The flat 12-month average under-goals a SKU that is clearly
+      selling faster now (LED-WLWW-30K-IP67-5M: 12mo 3/mo vs ~10/mo
+      now), which is exactly where the stock-outs were (RULES 9.16).
+      Other flags keep the 12-month rate (Project/Sporadic spikes are
+      deliberately damped).
     """
     base = _num(avg_daily_base) if avg_daily_base is not None else 0.0
     ad = base if base > 0 else _num(avg_daily)
+    if is_trend_up(trend_flag):
+        ad = max(ad, _num(avg_daily))
     if ad <= 0:
         return 0.0
     if _num(effective_units_90d) <= 0 and _num(effective_units_12mo) > 0:
@@ -148,6 +158,28 @@ def range_floor_units(planning_daily: float, abcd: str, *,
         return 0.0
     pack = _num(pack_qty)
     return pack if pack >= 1 else 1.0
+
+
+def is_trend_up(trend_flag) -> bool:
+    """True for the 📈 Trend label (demand clearly rising)."""
+    return "📈" in str(trend_flag or "")
+
+
+# 2026-09-25 (James) — SKUs that keep running out get extra safety
+# stock on top of the class/supplier safety %: stock-outs that STARTED
+# in the last 12 months (IP history, RULES 9.15) -> extra percentage
+# points. Project and dormant rows never get it (RULES 9.16).
+REPEAT_STOCKOUT_EXTRA_PCT: tuple[tuple[int, float], ...] = ((4, 50.0),
+                                                            (2, 25.0))
+
+
+def repeat_stockout_extra_pct(stockouts_12mo) -> float:
+    """Extra safety percentage points for a repeat stock-out SKU."""
+    n = _num(stockouts_12mo)
+    for threshold, extra in REPEAT_STOCKOUT_EXTRA_PCT:
+        if n >= threshold:
+            return extra
+    return 0.0
 
 
 def is_sporadic(trend_flag) -> bool:
@@ -293,7 +325,8 @@ def compute_stock_goal(df: pd.DataFrame, *,
         pd_ = planning_avg_daily(
             avg_daily.iat[i], eff12.iat[i], eff90.iat[i],
             avg_daily_base=(avg_daily_base.iat[i]
-                            if avg_daily_base is not None else None))
+                            if avg_daily_base is not None else None),
+            trend_flag=trend.iat[i])
         sku = skus.iat[i]
         if non_master.iat[i] or sku in zero_set:
             fl = 0.0

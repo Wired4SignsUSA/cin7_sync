@@ -551,6 +551,22 @@ service sales are not orders. Monthly Metrics' Stock optimisation
 progress chart draws the monthly count of orders hit as a red line
 (right axis, hover = % of all orders). Maths: `engine/stockouts.py`.
 
+**9.16 Avoid stock-outs (James, 2026-09-25).** Four changes. (1) 📈 Trend
+SKUs: the goal's planning rate is the HIGHER of the 12-month rate and
+the trend-adjusted `avg_daily` (other flags keep the 12-month rate).
+(2) Stock-health tiles never show the goal as one "cut to" number: row
+is Current · Goal · 🛒 Buy (understock) · ⏸️ Don't reorder (excess) ·
+Dead; the net gap sits in the detail. The goal is reached by buying the
+short items and not reordering the over-stocked ones, never by cutting
+buying across the board. (3) Repeat stock-outs: SKUs with 2–3 stock-outs
+started in 12 months (9.15) get +25 safety points, 4+ get +50, on top of
+the class/supplier safety % (not Project / Dormant); the calc trace
+says so. (4) `stockout_risk_alert.py` (Inngest, weekdays 07:45 ET) posts
+stocked SKUs (goal > 0, not dropship / Project) with nothing on order
+that are out, or will not last the lead time; Finishing / 865FabLab
+build SKUs listed separately (14-day build lead time). Channel
+`SLACK_STOCKOUT_RISK_CHANNEL_ID`. Maths: `engine/stockout_risk.py`.
+
 **10.1 team_actions.db stays local.** SQLite + cloud sync (GDrive / Dropbox / OneDrive) = database corruption. Never put this file in a live-synced folder. Use a nightly copy to GDrive backups as safety.
 
 **10.2 Source code lives in Git.** Not GDrive. Private GitHub repo. `.gitignore` excludes `.env`, `.venv/`, `output/*.csv`, `team_actions.db`, `.checkpoints/`.

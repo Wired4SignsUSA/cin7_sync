@@ -234,6 +234,11 @@ JOBS: list[Job] = [
         env=("SLACK_STOCK_ISSUES_CHANNEL_ID",), retries=1,
         note="read-only BOM bin-mismatch audit; channel override via "
              "SLACK_LOCATOR_AUDIT_CHANNEL_ID"),
+    Job("stockout_risk_alert",
+        "TZ=America/New_York 45 7 * * 1-5",
+        "python stockout_risk_alert.py run",
+        note="RULES 9.16 morning stock-out risk list (nothing on order) -> "
+             "SLACK_STOCKOUT_RISK_CHANNEL_ID (James 2026-09-25)"),
     Job("stock_issues_morning",
         f"TZ=America/New_York 30 {_hour_env('STOCK_ISSUE_MORNING_HOUR_ET', 8)} * * *",
         "python stock_issues_handler.py morning-summary",

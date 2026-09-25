@@ -81,6 +81,7 @@ from engine.stock_goal import (
     excess_and_understock,
     goal_units,
     is_sporadic,
+    repeat_stockout_extra_pct,
     sporadic_order_up_to,
     sporadic_safety_pct,
     planning_avg_daily,
@@ -8623,6 +8624,18 @@ def _load_ordering_shared_db_state() -> "SimpleNamespace":
         ip_lead_times_by_sku = db.get_ip_lead_times()
     except Exception:  # noqa: BLE001
         ip_lead_times_by_sku = {}
+    # 2026-09-25 (RULES 9.16) — stock-outs started in the last 12
+    # months per SKU (IP history, RULES 9.15). Repeat offenders get
+    # extra safety % in _compute_target_and_reorder.
+    try:
+        from app_pages.stockout_data import load_summary as _so_load_summary
+        _so_sum = _so_load_summary()
+        stockouts_12mo_by_sku = {
+            str(k): int(v) for k, v in zip(_so_sum["SKU"],
+                                           _so_sum["stockouts_12mo"])
+            if int(v or 0) >= 2}
+    except Exception:  # noqa: BLE001
+        stockouts_12mo_by_sku = {}
     try:
         sku_buying_settings_db = {
             str(r["sku"]): dict(r) for r in db.all_sku_pack()
@@ -8646,6 +8659,7 @@ def _load_ordering_shared_db_state() -> "SimpleNamespace":
         supp_configs=supp_configs,
         closures_by_supplier=closures_by_supplier,
         ip_lead_times_by_sku=ip_lead_times_by_sku,
+        stockouts_12mo_by_sku=stockouts_12mo_by_sku,
         sku_buying_settings_db=sku_buying_settings_db,
         sku_buying_settings=sku_buying_settings,
     )
@@ -8722,6 +8736,7 @@ def _build_ordering_context() -> "SimpleNamespace":
     supp_configs = _shared_db.supp_configs
     closures_by_supplier = _shared_db.closures_by_supplier
     ip_lead_times_by_sku = _shared_db.ip_lead_times_by_sku
+    stockouts_12mo_by_sku = getattr(_shared_db, "stockouts_12mo_by_sku", {})
     sku_buying_settings_db = _shared_db.sku_buying_settings_db
     # sku_buying_settings gets a per-session preview overlay merged in
     # below, so it must be this call's OWN copy, not the cached
@@ -8971,6 +8986,15 @@ def _build_ordering_context() -> "SimpleNamespace":
         _typical_order = float(row.get("median_order_qty_12mo") or 0)
         safety_pct = sporadic_safety_pct(
             safety_pct, cfg.get("safety_pct_c") or 15.0, is_sporadic_row)
+        # 2026-09-25 (James, RULES 9.16) — repeat stock-outs: SKUs that
+        # ran out 2+ times in 12 months carry extra safety stock.
+        _so_count = stockouts_12mo_by_sku.get(sku_key, 0)
+        _so_extra_pct = 0.0
+        if (str(row.get("trend_flag") or "") not in ("🎯 Project",
+                                                     "💤 Dormant")
+                and not bool(row.get("is_dormant", False))):
+            _so_extra_pct = repeat_stockout_extra_pct(_so_count)
+        safety_pct = float(safety_pct) + _so_extra_pct
         # v2.67.283 — review period = the supplier's ACTUAL reorder
         # cadence when configured (e.g. 7 for a weekly supplier).
         # The ABC-class review_days are only the fallback. Carrying
@@ -9139,7 +9163,8 @@ def _build_ordering_context() -> "SimpleNamespace":
         _plan_rate_for_floor = planning_avg_daily(
             avg_daily, row.get("effective_units_12mo"),
             row.get("effective_units_90d"),
-            avg_daily_base=row.get("avg_daily_base"))
+            avg_daily_base=row.get("avg_daily_base"),
+            trend_flag=row.get("trend_flag"))
         _range_floor = range_floor_units(
             _plan_rate_for_floor, _abcd_for_floor,
             pack_qty=sku_eoq,
@@ -9800,6 +9825,8 @@ def _build_ordering_context() -> "SimpleNamespace":
             + f"**ABC class**: {abc} → safety {safety_pct:.0f}%"
             + (" (⚡ Sporadic → class-C safety; goal = order-up-to, "
                "no class cover)" if is_sporadic_row else "")
+            + (f" (incl. +{_so_extra_pct:.0f} pts: ran out {_so_count}× "
+               f"in 12 months)" if _so_extra_pct else "")
             + "\n\n"
             f"**Review period**: {review_days}d — {review_basis}\n\n"
             f"**Lead-time demand**: {avg_daily:.2f} × {lead_time_days} "
@@ -9889,6 +9916,7 @@ def _build_ordering_context() -> "SimpleNamespace":
             "supp": supp_configs,
             "clos": closures_by_supplier,
             "ip_lt": ip_lead_times_by_sku,
+            "stockouts": stockouts_12mo_by_sku,
             "sku_buying": sku_buying_settings,
             "today": _today_for_engine.isoformat(),
         }, sort_keys=True, default=str)
@@ -10675,15 +10703,16 @@ def _render_stock_health_tiles(*, current, goal, excess, understock,
                                reorder_asof=None, scope="all stock",
                                goal_help=None, detail_title=None,
                                detail_fn=None, detail_inline=False):
-    """Four plain tiles + one folded detail panel. Used by the Command
+    """Five plain tiles + one folded detail panel. Used by the Command
     Centre, Stock Optimisation and every vendor on Ordering so the
     same numbers look the same everywhere (2026-09-04, James: "make
     things simpler"; users: "too busy, too much fuss").
 
-    Row: Current · Goal · Over/under goal (NET) · Dead.
-    Folded: Excess (gross) · Understock (gross) · Reorder level, with
+    Row: Current · Goal · 🛒 Buy (understock) · ⏸️ Don't reorder
+    (excess) · Dead (RULES 9.16, 2026-09-25).
+    Folded: Net over/short · Reorder level, with
     one sentence explaining why both gross figures can be large at
-    once. Returns the four tile columns so callers can add a line
+    once. Returns the five tile columns so callers can add a line
     under a tile (e.g. month-on-month dead-stock change)."""
     current = float(current or 0.0)
     goal = float(goal or 0.0)
@@ -10691,7 +10720,11 @@ def _render_stock_health_tiles(*, current, goal, excess, understock,
     understock = float(understock or 0.0)
     dead = float(dead or 0.0)
     gap = current - goal
-    c1, c2, c3, c4 = st.columns(4)
+    # 2026-09-25 (James, RULES 9.16): never show the goal as one "cut
+    # to" number — it read as "halve the stock" and would cause more
+    # stock-outs. Show the two actions separately: BUY what is short,
+    # DON'T REORDER what is over. The net gap moves to the detail.
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Current stock", _fmt_money(current),
               help=f"What we're holding right now ({scope}), at cost, "
                    "per CIN7.")
@@ -10703,24 +10736,20 @@ def _render_stock_health_tiles(*, current, goal, excess, understock,
                   f"{DEFAULT_COVER_DAYS['C']:g} for C, nothing for items "
                   "that haven't sold in 12 months. Never below the "
                   "reorder level; every live SKU gets at least one "
-                  "unit/pack. Same method on every page."))
-    if gap >= 0:
-        c3.metric("Over goal by", _fmt_money(gap),
-                  delta=(f"{gap / current * 100:.0f}% of current"
-                         if current else None),
-                  delta_color="inverse",
-                  help="Current stock minus goal. Positive = we hold "
-                       "more than we should overall. Open the detail "
-                       "panel below to see the over/short split.")
-    else:
-        c3.metric("Short of goal by", _fmt_money(-gap),
-                  delta=(f"{-gap / goal * 100:.0f}% of goal"
-                         if goal else None),
-                  delta_color="inverse",
-                  help="Goal minus current stock. We hold less than we "
-                       "should overall. Open the detail panel below to "
-                       "see the over/short split.")
-    c4.metric("Dead stock", _fmt_money(dead),
+                  "unit/pack. Same method on every page. Reach it by "
+                  "buying the short items and not reordering the "
+                  "over-stocked ones — not by cutting buying across "
+                  "the board."))
+    c3.metric("🛒 Buy — short items", _fmt_money(understock),
+              help="Added up per SKU: what it costs to bring every item "
+                   "below its goal up to goal. These are the items that "
+                   "run out — buy them.")
+    c4.metric("⏸️ Don't reorder — over goal", _fmt_money(excess),
+              help="Added up per SKU: the value above goal on every "
+                   "over-stocked item (includes dead stock). Let it sell "
+                   "down — don't reorder until it is back at goal. Not a "
+                   "reason to cut buying on short items.")
+    c5.metric("Dead stock", _fmt_money(dead),
               help=f"{_fmt_number(dead_skus)} SKUs that haven't sold a "
                    "single unit in 12 months but are still on the "
                    "shelf. Their goal is zero, so this is a clearance "
@@ -10736,13 +10765,13 @@ def _render_stock_health_tiles(*, current, goal, excess, understock,
             detail_title or "🔍 Detail — what's over, what's short, "
             "reorder level", expanded=False)
     with _detail_box:
-        d1, d2, d3 = st.columns(3)
-        d1.metric("Over-stocked items", _fmt_money(excess),
-                  help="Added up per SKU: for every item above its goal, "
-                       "the value above the goal. Includes dead stock.")
-        d2.metric("Short items", _fmt_money(understock),
-                  help="Added up per SKU: what it would cost to bring "
-                       "every item below its goal up to goal.")
+        d1, d3 = st.columns(2)
+        if gap >= 0:
+            d1.metric("Net: over goal by", _fmt_money(gap),
+                      help="Current stock minus goal, all SKUs netted.")
+        else:
+            d1.metric("Net: short of goal by", _fmt_money(-gap),
+                      help="Goal minus current stock, all SKUs netted.")
         if reorder_level is not None:
             d3.metric("Reorder level", _fmt_money(float(reorder_level)),
                       help="The level each SKU is topped up to when we "
@@ -10769,7 +10798,7 @@ def _render_stock_health_tiles(*, current, goal, excess, understock,
             f"{_fmt_money(understock)}.").replace("$", "\\$"))
         if detail_fn is not None:
             detail_fn()
-    return c1, c2, c3, c4
+    return c1, c2, c3, c4, c5
 
 
 # Training video toggle for pages that have one (app_pages/training_videos.py).
@@ -11509,7 +11538,7 @@ if page == "Overview":
             dead=_dead_value_ov, dead_skus=_dead_skus_ov,
             reorder_level=_reorder_level_cc, reorder_asof=_reorder_asof,
             detail_fn=_cc_health_detail)
-        sh5 = _sh_cols[3]
+        sh5 = _sh_cols[4]
         if _health_provisional:
             st.caption(
                 ":warning: Provisional — supplier lead-time config is not "
@@ -15664,14 +15693,10 @@ elif page == "Ordering":
         # Two $ in one string render as LaTeX in st.caption/markdown and
         # expander labels — escape them.
         st.caption(" · ".join(_facts).replace("$", "\\$"))
-        _net_gap = sw_stock_value - sw_goal_value
-        _health_label = "📊 Stock health — "
-        if _net_gap > 0:
-            _health_label += f"over goal by {_fmt_money(_net_gap)}"
-        elif _net_gap < 0:
-            _health_label += f"short of goal by {_fmt_money(-_net_gap)}"
-        else:
-            _health_label += "on goal"
+        # RULES 9.16 — show the two actions, not a net "cut to" figure.
+        _health_label = (
+            f"📊 Stock health — 🛒 buy {_fmt_money(sw_understock_value)}"
+            f" · ⏸️ don't reorder {_fmt_money(sw_excess_value)}")
         if sw_dead_value > 0:
             _health_label += f" · dead stock {_fmt_money(sw_dead_value)}"
         _health_label = _health_label.replace("$", "\\$")
