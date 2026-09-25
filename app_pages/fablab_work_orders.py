@@ -112,11 +112,15 @@ def build_planner_table(
     bom_parents: dict,
     weeks_cover: float,
     wip_map: Optional[dict] = None,
+    min_monthly_for_stock: float = 0.0,
 ) -> pd.DataFrame:
     """One row per flagged SKU: demand, open sales orders, on-hand, WIP
     already in production, suggested batch (net of WIP), and whether
     raw-material stock covers it.
-    wip_map: {sku: {"qty": float, "refs": [..]}} from db.fablab_wip_by_sku()."""
+    wip_map: {sku: {"qty": float, "refs": [..]}} from db.fablab_wip_by_sku().
+    min_monthly_for_stock: SKUs selling less than this per month get no
+    stock top-up (batch = open SO / backorder only) and are flagged
+    "Below min demand" (Finishing, James 2026-09-25)."""
     wip_map = wip_map or {}
     stock_map = _stock_by_sku(stock)
     engine_map = _rows_by_sku(engine_df)
@@ -141,7 +145,12 @@ def build_planner_table(
         units_12mo = _num(eng.get(
             "effective_units_12mo", eng.get("units_12mo", 0)))
         monthly_demand = units_12mo / 12.0
-        target_for_window = monthly_demand * (weeks_cover / 4.345)
+        below_min = monthly_demand + 1e-9 < float(min_monthly_for_stock or 0)
+        # 2026-09-25 (James): slow finishing SKUs (<1/mo) are not built
+        # for stock — only to cover open orders / backorders.
+        target_for_window = (0.0 if below_min
+                             else monthly_demand * (weeks_cover / 4.345))
+        backorder = _num(eng.get("unfulfilled", 0))
         # 2026-09-04 (James): whole units only — round UP so the batch
         # always covers the window (you can't build 0.3 of a part).
         # 2026-09-04 (James): units already in production at 865FabLab
@@ -183,7 +192,11 @@ def build_planner_table(
             "Open SO": int(round(open_so)),
             "WIP": int(round(wip)),
             "WIP ref": wip_refs,
+            "Backorder": int(round(backorder)),
+            "Last 6 months": ("" if pd.isna(eng.get("last_6mo_series"))
+                              else str(eng.get("last_6mo_series") or "")),
             "Monthly demand": round(monthly_demand, 2),
+            "Below min demand": bool(below_min),
             "Suggested batch": int(suggested),
             "Buildable from stock": round(buildable, 1),
             "Materials status": status,
@@ -992,6 +1005,10 @@ def render_fablab_work_orders(
     planner_df = build_planner_table(
         flagged_skus, products, stock, engine_df, bom_parents, weeks_cover,
         wip_map=wip_map)
+    # Finishing-only columns (2026-09-25); corners page unchanged.
+    planner_df = planner_df.drop(
+        columns=["Backorder", "Last 6 months", "Below min demand"],
+        errors="ignore")
     if planner_df.empty:
         st.warning("No data for flagged SKUs.")
         return

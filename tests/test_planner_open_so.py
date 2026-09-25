@@ -40,3 +40,27 @@ def test_no_allocated_column_is_fine():
     df = build_planner_table(["FIN-1"], products, stock, engine, bom, weeks_cover=4.345)
     assert df.iloc[0]["Open SO"] == 0
     assert df.iloc[0]["Suggested batch"] == 0
+
+
+def test_below_min_monthly_no_stock_topup():
+    # 6/yr = 0.5/mo < 1 -> no stock batch (James 2026-09-25, finishing)
+    df = build_planner_table(["FIN-1"], *_frames(on_hand=0, allocated=0, units_12mo=6.0),
+                             weeks_cover=8.0, min_monthly_for_stock=1.0)
+    row = df.iloc[0]
+    assert bool(row["Below min demand"]) is True
+    assert row["Suggested batch"] == 0
+
+
+def test_below_min_monthly_still_covers_open_orders():
+    df = build_planner_table(["FIN-1"], *_frames(on_hand=0, allocated=5, units_12mo=6.0),
+                             weeks_cover=8.0, min_monthly_for_stock=1.0)
+    assert df.iloc[0]["Suggested batch"] == 5
+
+
+def test_last_6_months_and_backorder_columns():
+    products, stock, engine, bom = _frames(on_hand=0, allocated=0)
+    engine["last_6mo_series"] = "4  0  0  0  15  50"
+    engine["unfulfilled"] = 50
+    df = build_planner_table(["FIN-1"], products, stock, engine, bom, weeks_cover=8.0)
+    assert df.iloc[0]["Last 6 months"] == "4  0  0  0  15  50"
+    assert df.iloc[0]["Backorder"] == 50

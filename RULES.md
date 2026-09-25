@@ -529,6 +529,15 @@ JSON, current month-to-date vs prior month. Access: Buy/SKU/Approve
 follow Ordering permission, Metrics follows Monthly Metrics. Helpers in
 `engine/mobile_summary.py`; no new math.
 
+**9.14 Finishing planner minimum demand (James, 2026-09-25).** Finishing
+Work Orders (and the daily finishing Slack alert) do not build stock for
+SKUs selling under 1 unit/month (12mo effective units ÷ 12): their
+suggested batch covers only open sales orders / backorders, and the page
+hides them unless they have an open SO, backorder, WIP or a batch qty on
+the current order. The table shows "Last 6 months" (same monthly numbers
+as Ordering) and "Backorder" (engine `unfulfilled`). 865FabLab corners
+are unchanged.
+
 **10.1 team_actions.db stays local.** SQLite + cloud sync (GDrive / Dropbox / OneDrive) = database corruption. Never put this file in a live-synced folder. Use a nightly copy to GDrive backups as safety.
 
 **10.2 Source code lives in Git.** Not GDrive. Private GitHub repo. `.gitignore` excludes `.env`, `.venv/`, `output/*.csv`, `team_actions.db`, `.checkpoints/`.

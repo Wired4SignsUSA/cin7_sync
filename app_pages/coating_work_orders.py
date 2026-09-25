@@ -38,6 +38,9 @@ from app_pages.fablab_work_orders import (
 from outsource_flows import FINISHING, parse_finishing_service
 
 FINISHING_SUPPLIER = FINISHING.supplier
+# 2026-09-25 (James): finishing SKUs selling < 1/month are not built for
+# stock; they only appear when there is an open order / backorder.
+FINISHING_MIN_MONTHLY_FOR_STOCK = 1.0
 _LEGACY_SERVICE_CATEGORIES = ("Services - Powder Coating", "Services - Anodizing")
 
 
@@ -215,7 +218,7 @@ def render_finishing_work_orders(
         wip_map = {}
     planner_df = build_planner_table(
         candidates, products, stock, engine_df, bom_parents, weeks_cover,
-        wip_map=wip_map)
+        wip_map=wip_map, min_monthly_for_stock=FINISHING_MIN_MONTHLY_FOR_STOCK)
     if planner_df.empty:
         st.warning("No data for finishing SKUs.")
         return
@@ -233,9 +236,21 @@ def render_finishing_work_orders(
         or (pretick_all and pd.notna(sug) and float(sug) > 0)
         for sku, sug in zip(planner_df["SKU"], planner_df["Suggested batch"])]
     order = ["Include", "SKU", "Name", "Process", "Colour", "ABC", "Status",
-             "On hand", "Open SO", "WIP", "WIP ref", "Monthly demand", "Suggested batch",
+             "On hand", "Open SO", "Backorder", "WIP", "WIP ref", "Last 6 months",
+             "Monthly demand", "Suggested batch",
              "Batch qty", "Raw profile", "Buildable from stock", "Materials status",
              "Materials", "Service (BOM)", "Auto-assembly"]
+    # Slow sellers (< 1/mo) drop off unless something is owed or in hand.
+    slow_hidden = (
+        planner_df["Below min demand"].fillna(False).astype(bool)
+        & (planner_df["Open SO"].fillna(0) <= 0)
+        & (planner_df["Backorder"].fillna(0) <= 0)
+        & (planner_df["WIP"].fillna(0) <= 0)
+        & (planner_df["Batch qty"].fillna(0) <= 0)
+    ) if "Below min demand" in planner_df.columns else pd.Series(
+        False, index=planner_df.index)
+    n_slow_hidden = int(slow_hidden.sum())
+    planner_df = planner_df[~slow_hidden]
     planner_df = planner_df[[c for c in order if c in planner_df.columns]]
 
     view = planner_df
@@ -252,6 +267,10 @@ def render_finishing_work_orders(
             mask |= view[col].astype(str).str.contains(q, case=False, na=False, regex=False)
         view = view[mask]
     view = view.copy()
+
+    if n_slow_hidden:
+        st.caption(f"{n_slow_hidden} SKUs selling under 1/month with no open "
+                   "order or backorder are hidden (not built for stock).")
 
     qty_editable = (draft_id is None) or can_edit
     if draft_id and is_submitted:
@@ -277,9 +296,19 @@ def render_finishing_work_orders(
                 "🎨 WIP", format="%d",
                 help="Already out at All Star (open assemblies not yet marked "
                      "done). Counted as covered."),
+            "Backorder": st.column_config.NumberColumn(
+                "⏳ Backorder", format="%d",
+                help="Units on backorder in CIN7 (sold, not in stock)."),
+            "Last 6 months": st.column_config.TextColumn(
+                "Last 6 months",
+                help="Units sold in each of the last 6 calendar months — "
+                     "oldest on the left, current month on the right. "
+                     "Same numbers as the Ordering page.",
+                width="medium"),
             "Monthly demand": st.column_config.NumberColumn(format="%.2f"),
             "Suggested batch": st.column_config.NumberColumn(
-                format="%d", help="Target + open SO − on hand − WIP, whole units."),
+                format="%d", help="Target + open SO − on hand − WIP, whole units. "
+                                  "Under 1/month: open SO / backorder only."),
             "Buildable from stock": st.column_config.NumberColumn(
                 "Raw covers", format="%.1f",
                 help="How many can be made from raw profile on hand."),

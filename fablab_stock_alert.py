@@ -177,7 +177,9 @@ def run(apply: bool = True, flow: Flow = FABLAB) -> dict:
     planner_df = build_planner_table(
         flagged_skus, products, stock, engine_df, bom_parents,
         weeks_cover=WEEKS_COVER.get(flow.key, DEFAULT_WEEKS_COVER),
-        wip_map=wip_map)
+        wip_map=wip_map,
+        # 2026-09-25 (James): finishing SKUs < 1/mo only for open orders.
+        min_monthly_for_stock=(1.0 if flow.key == "finishing" else 0.0))
     if planner_df.empty:
         log.info("Planner table came back empty; nothing to check.")
         return {"alerted": [], "cleared": []}
