@@ -30,14 +30,19 @@ def _eng():
         # finishing build SKU, 14d build lead time
         {"SKU": "FIN", "ABCD": "C", "goal_units": 6, "Available": 2,
          "OnOrder": 0, "avg_daily": 0.5, "Supplier": "X"},
+        # 865FabLab supplier, no BOM service line -> Corners by supplier
+        {"SKU": "CRN", "ABCD": "C", "goal_units": 6, "Available": 0,
+         "OnOrder": 0, "avg_daily": 0.5, "Supplier": "865FabLab"},
     ])
 
 
 def test_risk_table_flags_only_uncovered_stocked_skus():
     t = sr.risk_table(_eng(), lead_time_fn=lambda s, sup: 35,
                       stockouts_12mo={"OUT": 3},
-                      build_skus={"FIN": "Finishing"})
-    assert list(t["SKU"]) == ["OUT", "SOON", "FIN"]
+                      build_skus={"FIN": "Finishing"},
+                      build_suppliers={"865FabLab": "Corners"})
+    assert list(t["SKU"]) == ["OUT", "CRN", "SOON", "FIN"]
+    assert t.set_index("SKU").loc["CRN", "build"] == "Corners"
     assert t.set_index("SKU").loc["FIN", "lead_time"] == sr.BUILD_LEAD_TIME_DAYS
     msg = sr.format_message(t)
     assert "1 out now" in msg and "1 will run out" in msg

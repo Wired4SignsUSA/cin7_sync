@@ -59,10 +59,14 @@ def lead_time_days(sku: str, supplier: str, *,
 def risk_table(engine_df: pd.DataFrame, *,
                lead_time_fn: Callable[[str, str], int],
                stockouts_12mo: Mapping[str, int] | None = None,
-               build_skus: Mapping[str, str] | None = None) -> pd.DataFrame:
+               build_skus: Mapping[str, str] | None = None,
+               build_suppliers: Mapping[str, str] | None = None
+               ) -> pd.DataFrame:
     """One row per at-risk SKU, most urgent first.
 
     build_skus: {sku: "Finishing" | "Corners"} for build-replenished SKUs.
+    build_suppliers: {supplier name: flow label} — same tag by supplier
+    (e.g. 865FabLab SKUs whose BOM has no service line).
     """
     cols = ["SKU", "Name", "ABCD", "Supplier", "status", "available",
             "backordered", "daily", "days_left", "lead_time", "stockouts_12mo",
@@ -78,6 +82,7 @@ def risk_table(engine_df: pd.DataFrame, *,
     df = df[keep]
     so = stockouts_12mo or {}
     builds = build_skus or {}
+    b_sup = {str(k).strip().lower(): v for k, v in (build_suppliers or {}).items()}
     out = []
     for _, r in df.iterrows():
         sku = str(r.get("SKU") or "")
@@ -88,8 +93,8 @@ def risk_table(engine_df: pd.DataFrame, *,
         avail = (_num(avail) if avail is not None and avail == avail
                  else _num(r.get("OnHand")) - _num(r.get("Allocated")))
         daily = max(_num(r.get("planning_avg_daily")), _num(r.get("avg_daily")))
-        build = builds.get(sku, "")
         supplier = str(r.get("Supplier") or "")
+        build = builds.get(sku, "") or b_sup.get(supplier.strip().lower(), "")
         lt = BUILD_LEAD_TIME_DAYS if build else int(lead_time_fn(sku, supplier))
         if avail <= 0:
             status = "out"

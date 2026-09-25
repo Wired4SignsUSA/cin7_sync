@@ -85,8 +85,13 @@ def build_table() -> pd.DataFrame:
         return sr.lead_time_days(sku, supplier, supplier_cfgs=cfgs,
                                  ip_lead_times=ip_lt, sku_lead_times=sku_lt)
 
+    try:
+        from outsource_flows import FABLAB, FINISHING
+        b_sup = {FABLAB.supplier: "Corners", FINISHING.supplier: "Finishing"}
+    except Exception:  # noqa: BLE001
+        b_sup = {}
     return sr.risk_table(engine_df, lead_time_fn=_lt, stockouts_12mo=counts,
-                         build_skus=_build_skus())
+                         build_skus=_build_skus(), build_suppliers=b_sup)
 
 
 def run(dryrun: bool = False) -> int:
