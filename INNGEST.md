@@ -119,3 +119,14 @@ re-fetched every completed FG task in a ~210-day candidate window
 14-day TTL for in-window tasks; `CIN7_ASSEMBLY_DETAIL_CACHE=0` disables).
 The first run after deploy warms the cache (still ~7 h); later runs
 fetch only new tasks.
+
+## Incremental detail cache (2026-09-25)
+`salelines`, `purchaselines` and `boms` cache each record's extracted result in
+`/data/output/.{sale,purchase,bom}_detail_cache.json`, keyed by the list
+endpoint's last-updated stamp (`Updated` / `LastUpdatedDate` / `LastModifiedOn`).
+Only new or changed records are fetched from Cin7; outputs are unchanged. The
+cache is namespaced by a hash of the extractor code, merges on save (nearsync
+and the nightly can share it) and prunes entries unseen for 120 days.
+- Weekly full refresh: `CIN7_FULL_REFRESH_WEEKDAY` (default 6 = Sunday UTC, -1 = never)
+- Force one: `CIN7_FULL_REFRESH=1`; disable: `CIN7_DETAIL_CACHE=0`
+- Log line: `<kind> detail cache: N hits, M CIN7 fetches.`

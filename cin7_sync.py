@@ -1292,6 +1292,134 @@ def _extract_purchase_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> L
     return out
 
 
+# ---------------------------------------------------------------------------
+# Incremental detail cache (2026-09-25). Sale/purchase/BOM detail calls are
+# ~2.5 s each; most records in a 30-day window have not changed since the
+# previous night. Cache the extracted result per record, keyed by the list
+# endpoint's "last updated" stamp, and only re-fetch new/changed records.
+# Outputs are unchanged. A weekly full refresh (default Sunday UTC) ignores
+# cached entries and re-fetches everything as a safety net.
+#   CIN7_DETAIL_CACHE=0          disable entirely
+#   CIN7_FULL_REFRESH_WEEKDAY=6  0=Mon..6=Sun, -1 = never
+#   CIN7_FULL_REFRESH=1          force a full refresh this run
+# ---------------------------------------------------------------------------
+
+
+def _full_refresh_today() -> bool:
+    if os.environ.get("CIN7_FULL_REFRESH", "0") == "1":
+        return True
+    try:
+        wd = int(os.environ.get("CIN7_FULL_REFRESH_WEEKDAY", "6"))
+    except ValueError:
+        wd = 6
+    return wd >= 0 and datetime.now(timezone.utc).weekday() == wd
+
+
+class _DetailCache:
+    """record id -> {u: updated stamp, t: last-seen epoch, v: cached value}.
+    One JSON file per kind next to the outputs. `version` namespaces the
+    cache so a change to the extractor code invalidates old entries."""
+
+    PRUNE_DAYS = 120
+
+    def __init__(self, path: Path, data: Dict[str, Any], version: str,
+                 enabled: bool, refresh: bool) -> None:
+        self.path, self.data, self.version = path, data, version
+        self.enabled, self.refresh = enabled, refresh
+        self.dirty = False
+        self.hits = self.fetches = 0
+
+    @classmethod
+    def load(cls, kind: str, version: str = "") -> "_DetailCache":
+        enabled = os.environ.get("CIN7_DETAIL_CACHE", "1") != "0"
+        refresh = _full_refresh_today()
+        path = OUTPUT_DIR / f".{kind}_detail_cache.json"
+        data: Dict[str, Any] = {}
+        if enabled:
+            data = cls._read(path, version)
+            log.info("  %s detail cache: %d record(s) cached%s.", kind, len(data),
+                     " (weekly full refresh: ignoring cache)" if refresh else "")
+        return cls(path, data, version, enabled, refresh)
+
+    @staticmethod
+    def _read(path: Path, version: str) -> Dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("  detail cache %s unreadable (%s); starting empty",
+                        path.name, exc)
+            return {}
+        if raw.get("version") != version:
+            return {}
+        recs = raw.get("records")
+        return recs if isinstance(recs, dict) else {}
+
+    def get(self, rid: str, stamp: Any) -> Any:
+        """Cached value if the record is unchanged, else None."""
+        if not (self.enabled and stamp) or self.refresh:
+            return None
+        ent = self.data.get(rid)
+        if isinstance(ent, dict) and ent.get("u") == stamp and "v" in ent:
+            ent["t"] = time.time()
+            self.dirty = True
+            self.hits += 1
+            return ent["v"]
+        return None
+
+    def put(self, rid: str, stamp: Any, value: Any) -> None:
+        self.fetches += 1
+        if not (self.enabled and stamp):
+            return
+        self.data[rid] = {"u": stamp, "t": time.time(), "v": value}
+        self.dirty = True
+
+    def save(self) -> None:
+        if not (self.enabled and self.dirty):
+            return
+        # Merge with whatever another process (e.g. nearsync) saved meanwhile.
+        merged = self._read(self.path, self.version)
+        for k, v in self.data.items():
+            if float(v.get("t", 0)) >= float(merged.get(k, {}).get("t", 0)):
+                merged[k] = v
+        cutoff = time.time() - self.PRUNE_DAYS * 86400
+        merged = {k: v for k, v in merged.items()
+                  if float(v.get("t", 0)) >= cutoff}
+        tmp = self.path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps({"version": self.version,
+                                       "records": merged}, default=str),
+                           encoding="utf-8")
+            os.replace(tmp, self.path)
+            self.data = merged
+            self.dirty = False
+        except OSError as exc:
+            log.warning("  detail cache save failed: %s", exc)
+
+    def summary(self, kind: str) -> None:
+        if self.enabled:
+            log.info("  %s detail cache: %d hits, %d CIN7 fetches.",
+                     kind, self.hits, self.fetches)
+
+
+def _code_version(*funcs: Any) -> str:
+    import hashlib
+    import inspect
+    h = hashlib.sha1()
+    for f in funcs:
+        try:
+            h.update(inspect.getsource(f).encode("utf-8"))
+        except (OSError, TypeError):
+            h.update(repr(f).encode("utf-8"))
+    return h.hexdigest()[:12]
+
+
+def _header_stamp(header: Dict[str, Any]) -> Any:
+    return header.get("Updated") or header.get("LastUpdatedDate")
+
+
+
 def _fetch_lines_by_header(
     client: Cin7Client,
     headers: List[Dict[str, Any]],
@@ -1300,6 +1428,7 @@ def _fetch_lines_by_header(
     extractor,
     checkpoint_name: str,
     output_name: str,
+    cache_kind: Optional[str] = None,
 ) -> None:
     """Loop through a list of header records, fetch each detail, extract lines,
     checkpoint progress, and write consolidated output at the end.
@@ -1314,12 +1443,21 @@ def _fetch_lines_by_header(
     log.info("Fetching %d %s details (resuming from %d already processed)...",
              total, label, len(processed))
 
+    cache = (_DetailCache.load(cache_kind, _code_version(extractor))
+             if cache_kind else None)
     errors = 0
     try:
         for i, header in enumerate(headers, 1):
             record_id = header.get(id_field) or header.get("ID")
             if not record_id or record_id in processed:
                 continue
+            stamp = _header_stamp(header)
+            if cache is not None:
+                cached = cache.get(record_id, stamp)
+                if cached is not None:
+                    all_lines.extend(cached)
+                    processed.add(record_id)
+                    continue
             path = detail_path(header) if callable(detail_path) else detail_path
             try:
                 detail = client.get(path, params={"ID": record_id})
@@ -1336,8 +1474,12 @@ def _fetch_lines_by_header(
             lines = extractor(detail, header)
             all_lines.extend(lines)
             processed.add(record_id)
+            if cache is not None:
+                cache.put(record_id, stamp, lines)
 
             if i % 25 == 0 or i == total:
+                if cache is not None:
+                    cache.save()
                 _save_checkpoint(checkpoint_name, {
                     "processed_ids": list(processed),
                     "lines": all_lines,
@@ -1353,7 +1495,12 @@ def _fetch_lines_by_header(
             "updated": datetime.now().isoformat(),
         })
         raise
+    finally:
+        if cache is not None:
+            cache.save()
 
+    if cache is not None:
+        cache.summary(cache_kind)
     write_outputs(output_name, all_lines)
     _clear_checkpoint(checkpoint_name)
 
@@ -1381,6 +1528,7 @@ def sync_salelines(client: Cin7Client, days: int) -> None:
         extractor=_extract_sale_lines,
         checkpoint_name=f"salelines_{days}d",
         output_name=f"sale_lines_last_{days}d",
+        cache_kind="sale",
     )
 
     # Auto-reconcile pending demand signals against the freshly-written
@@ -1458,6 +1606,7 @@ def sync_purchaselines(client: Cin7Client, days: int) -> None:
         extractor=_extract_purchase_lines,
         checkpoint_name=f"purchaselines_{days}d",
         output_name=f"purchase_lines_last_{days}d",
+        cache_kind="purchase",
     )
 
 
@@ -1902,6 +2051,70 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+_BOM_COMP_FIELDS = ("ProductCode", "SKU", "ComponentProductID", "ProductID",
+                    "Name", "Quantity")
+
+
+def _trim_bom_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only the fields sync_boms needs from a /product?IncludeBOM detail."""
+    comps = rec.get("BillOfMaterialsProducts") or []
+    if not isinstance(comps, list):
+        comps = []
+    return {
+        "Name": rec.get("Name"),
+        "BOMType": rec.get("BOMType"),
+        "AutoAssembly": rec.get("AutoAssembly"),
+        "AutoDisassembly": rec.get("AutoDisassembly"),
+        "BillOfMaterialsProducts": [
+            {f: c.get(f) for f in _BOM_COMP_FIELDS}
+            for c in comps if isinstance(c, dict)
+        ],
+    }
+
+
+def _bom_rows(sku: Any, prod: Dict[str, Any], rec: Dict[str, Any],
+              by_id: Dict[Any, Dict[str, Any]],
+              by_sku: Dict[Any, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flatten one (trimmed) BOM record into output rows. Component names
+    are resolved against the current product list on every run, so a cached
+    BOM still picks up component renames."""
+    assembly_name = rec.get("Name") or prod.get("Name")
+    bom_type = rec.get("BOMType") or prod.get("BOMType")
+    auto_asm = rec.get("AutoAssembly") or prod.get("AutoAssembly")
+    auto_dis = rec.get("AutoDisassembly") or prod.get("AutoDisassembly")
+    rows: List[Dict[str, Any]] = []
+    for c in rec.get("BillOfMaterialsProducts") or []:
+        if not isinstance(c, dict):
+            continue
+        # CIN7's BillOfMaterialsProducts uses these exact field names:
+        #   ProductCode         — the component's SKU (string)
+        #   ComponentProductID  — the component's product UUID
+        # Older/alternative names kept as fallbacks.
+        comp_sku = (
+            c.get("ProductCode")
+            or c.get("SKU")
+            or by_id.get(c.get("ComponentProductID"), {}).get("SKU")
+            or by_id.get(c.get("ProductID"), {}).get("SKU")
+        )
+        comp_name = (
+            c.get("Name")
+            or by_id.get(c.get("ComponentProductID"), {}).get("Name")
+            or by_id.get(c.get("ProductID"), {}).get("Name")
+            or by_sku.get(comp_sku, {}).get("Name")
+        )
+        rows.append({
+            "AssemblySKU": sku,
+            "AssemblyName": assembly_name,
+            "ComponentSKU": comp_sku,
+            "ComponentName": comp_name,
+            "Quantity": c.get("Quantity"),
+            "BOMType": bom_type,
+            "AutoAssembly": auto_asm,
+            "AutoDisassembly": auto_dis,
+        })
+    return rows
+
+
 def sync_boms(client: Cin7Client, days: int = 0) -> None:
     """Fetch BOM structure for every BOM-flagged product.
 
@@ -1950,12 +2163,19 @@ def sync_boms(client: Cin7Client, days: int = 0) -> None:
     processed: set = set(state.get("processed_ids") or [])
     all_rows = state.get("rows") or []
 
+    cache = _DetailCache.load("bom", _code_version(_trim_bom_record))
     errors = 0
     try:
         for i, prod in enumerate(bom_products, 1):
             pid = prod.get("ID")
             sku = prod.get("SKU")
             if not pid or pid in processed:
+                continue
+            stamp = prod.get("LastModifiedOn")
+            cached = cache.get(pid, stamp)
+            if cached is not None:
+                all_rows.extend(_bom_rows(sku, prod, cached, by_id, by_sku))
+                processed.add(pid)
                 continue
             try:
                 # IncludeBOM=true is required or CIN7 omits BillOfMaterials* !
@@ -1982,49 +2202,13 @@ def sync_boms(client: Cin7Client, days: int = 0) -> None:
                 ps = detail.get("Products") or []
                 if ps and isinstance(ps[0], dict):
                     rec = ps[0]
-
-            comps = rec.get("BillOfMaterialsProducts") or []
-            if not isinstance(comps, list):
-                comps = []
-
-            assembly_name = rec.get("Name") or prod.get("Name")
-            bom_type = rec.get("BOMType") or prod.get("BOMType")
-            auto_asm = rec.get("AutoAssembly") or prod.get("AutoAssembly")
-            auto_dis = rec.get("AutoDisassembly") or prod.get("AutoDisassembly")
-
-            for c in comps:
-                if not isinstance(c, dict):
-                    continue
-                # CIN7's BillOfMaterialsProducts uses these exact field names:
-                #   ProductCode         — the component's SKU (string)
-                #   ComponentProductID  — the component's product UUID
-                # Older/alternative names kept as fallbacks in case CIN7
-                # ever changes the schema or plan tier.
-                comp_sku = (
-                    c.get("ProductCode")
-                    or c.get("SKU")
-                    or by_id.get(c.get("ComponentProductID"), {}).get("SKU")
-                    or by_id.get(c.get("ProductID"), {}).get("SKU")
-                )
-                comp_name = (
-                    c.get("Name")
-                    or by_id.get(c.get("ComponentProductID"), {}).get("Name")
-                    or by_id.get(c.get("ProductID"), {}).get("Name")
-                    or by_sku.get(comp_sku, {}).get("Name")
-                )
-                all_rows.append({
-                    "AssemblySKU": sku,
-                    "AssemblyName": assembly_name,
-                    "ComponentSKU": comp_sku,
-                    "ComponentName": comp_name,
-                    "Quantity": c.get("Quantity"),
-                    "BOMType": bom_type,
-                    "AutoAssembly": auto_asm,
-                    "AutoDisassembly": auto_dis,
-                })
+            rec = _trim_bom_record(rec if isinstance(rec, dict) else {})
+            cache.put(pid, stamp, rec)
+            all_rows.extend(_bom_rows(sku, prod, rec, by_id, by_sku))
             processed.add(pid)
 
             if i % 25 == 0 or i == len(bom_products):
+                cache.save()
                 _save_checkpoint("boms", {
                     "processed_ids": list(processed),
                     "rows": all_rows,
@@ -2040,7 +2224,10 @@ def sync_boms(client: Cin7Client, days: int = 0) -> None:
             "updated": datetime.now().isoformat(),
         })
         raise
+    finally:
+        cache.save()
 
+    cache.summary("bom")
     write_outputs("boms", all_rows)
     _clear_checkpoint("boms")
 
