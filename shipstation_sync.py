@@ -158,6 +158,47 @@ def _respect_rate_limits(resp: requests.Response) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _get_shipments_page(session: requests.Session, base: str,
+                         params: Dict[str, Any]) -> Dict[str, Any]:
+    """GET one /shipments page with retry on network errors, 429 and
+    5xx. Raises RuntimeError on any other non-2xx response."""
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            resp = session.get(f"{base}/shipments", params=params,
+                               timeout=DEFAULT_TIMEOUT)
+        except requests.RequestException as exc:
+            if attempt >= MAX_RETRIES:
+                raise
+            wait = 2 ** attempt
+            log.warning("Network error %s — retrying in %ds", exc, wait)
+            time.sleep(wait)
+            continue
+
+        if resp.status_code == 429:
+            # Honour Retry-After header if present, otherwise 60s.
+            wait = int(resp.headers.get("Retry-After", "60"))
+            log.warning("429 rate limit — sleeping %ss", wait)
+            time.sleep(wait)
+            continue
+
+        if 500 <= resp.status_code < 600 and attempt < MAX_RETRIES:
+            wait = 2 ** attempt
+            log.warning("Server %s — retrying in %ds",
+                        resp.status_code, wait)
+            time.sleep(wait)
+            continue
+
+        if not resp.ok:
+            raise RuntimeError(
+                f"ShipStation API {resp.status_code} on /shipments: "
+                f"{resp.text[:300]}")
+
+        _respect_rate_limits(resp)
+        return resp.json() or {}
+
+
 def _paginate_shipments(session: requests.Session,
                          params: Dict[str, Any],
                          api_version: str = "v1"
@@ -169,54 +210,19 @@ def _paginate_shipments(session: requests.Session,
     v1 response shape: `{shipments: [...], total, page, pages}`.
     v2 response shape: `{shipments: [...], links: {next: {href}},
     total, page, pages}` (ShipStation v2 still includes page/pages
-    so we can use the same loop)."""
+    so we can use the same loop).
+
+    NOTE v2 caps page*page_size (~15,000 rows) — callers on v2 must
+    keep each query under V2_MAX_OFFSET_ROWS; use
+    _iter_v2_shipments, which splits the date window to do so."""
     base = BASE_URL_V2 if api_version == "v2" else BASE_URL_V1
+    # v2 uses page_size (snake_case); v1 uses pageSize.
+    page_param = "page_size" if api_version == "v2" else "pageSize"
     page = 1
     while True:
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                # v2 uses page_size (snake_case); v1 uses pageSize.
-                page_param = ("page_size"
-                              if api_version == "v2" else "pageSize")
-                resp = session.get(
-                    f"{base}/shipments",
-                    params={**params, "page": page,
-                            page_param: DEFAULT_PAGE_SIZE},
-                    timeout=DEFAULT_TIMEOUT)
-            except requests.RequestException as exc:
-                if attempt >= MAX_RETRIES:
-                    raise
-                wait = 2 ** attempt
-                log.warning("Network error %s — retrying in %ds",
-                              exc, wait)
-                time.sleep(wait)
-                continue
-
-            if resp.status_code == 429:
-                # Honour Retry-After header if present, otherwise 60s.
-                wait = int(resp.headers.get("Retry-After", "60"))
-                log.warning("429 rate limit — sleeping %ss", wait)
-                time.sleep(wait)
-                continue
-
-            if 500 <= resp.status_code < 600 and attempt < MAX_RETRIES:
-                wait = 2 ** attempt
-                log.warning("Server %s — retrying in %ds",
-                              resp.status_code, wait)
-                time.sleep(wait)
-                continue
-
-            if not resp.ok:
-                raise RuntimeError(
-                    f"ShipStation API {resp.status_code} on /shipments: "
-                    f"{resp.text[:300]}")
-
-            _respect_rate_limits(resp)
-            payload = resp.json() or {}
-            break
-
+        payload = _get_shipments_page(
+            session, base,
+            {**params, "page": page, page_param: DEFAULT_PAGE_SIZE})
         shipments = payload.get("shipments") or []
         for s in shipments:
             yield s
@@ -224,11 +230,106 @@ def _paginate_shipments(session: requests.Session,
         total_pages = payload.get("pages") or 1
         if page >= total_pages or not shipments:
             log.info("  Page %d/%d done (%d shipments).",
-                       page, total_pages, len(shipments))
+                     page, total_pages, len(shipments))
             return
         log.info("  Page %d/%d (%d shipments).",
-                   page, total_pages, len(shipments))
+                 page, total_pages, len(shipments))
         page += 1
+
+
+# v2 (ShipEngine) rejects any request whose offset (page*page_size)
+# passes ~15,000 rows: "Pagination offset exceeds the maximum allowed
+# value". Page 29 @500 works, page 30 fails (checked 2026-09-26). We
+# stay safely under it by splitting the date window.
+V2_MAX_OFFSET_ROWS = 14000
+# Minimum window we'll split down to — guards against infinite
+# recursion if a single second somehow held >14k shipments.
+_V2_MIN_WINDOW = timedelta(minutes=1)
+# v2 /shipments also returns 'pending' shipments that never got a
+# label. On W4S's account something (checkout rate quotes) creates
+# ~4-5k of those a day with no shipment_number — 115k of the 117k
+# rows in a 30-day window on 2026-09-26. They carry no cost/tracking
+# and no invoice join key, so by default we only pull shipments that
+# matter downstream. Override with SHIPSTATION_V2_STATUSES (comma
+# list; "all" = no status filter).
+DEFAULT_V2_STATUSES = ("label_purchased", "cancelled")
+_V2_TS_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _v2_statuses() -> List[Optional[str]]:
+    raw = os.environ.get("SHIPSTATION_V2_STATUSES", "").strip()
+    if not raw:
+        return list(DEFAULT_V2_STATUSES)
+    if raw.lower() == "all":
+        return [None]
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _v2_window_params(start: datetime, end: datetime,
+                      status: Optional[str]) -> Dict[str, Any]:
+    params: Dict[str, Any] = {
+        "created_at_start": start.strftime(_V2_TS_FMT),
+        "created_at_end": end.strftime(_V2_TS_FMT),
+    }
+    if status:
+        params["shipment_status"] = status
+    return params
+
+
+def _v2_window_total(session: requests.Session,
+                     params: Dict[str, Any]) -> int:
+    payload = _get_shipments_page(
+        session, BASE_URL_V2, {**params, "page": 1, "page_size": 1})
+    return int(payload.get("total") or 0)
+
+
+def _iter_v2_window(session: requests.Session, start: datetime,
+                    end: datetime, status: Optional[str]
+                    ) -> Iterable[Dict[str, Any]]:
+    params = _v2_window_params(start, end, status)
+    total = _v2_window_total(session, params)
+    if total == 0:
+        return
+    if total > V2_MAX_OFFSET_ROWS and (end - start) > _V2_MIN_WINDOW:
+        mid = start + (end - start) / 2
+        log.info("  %s window %s → %s has %d shipments; splitting.",
+                 status or "all", params["created_at_start"],
+                 params["created_at_end"], total)
+        yield from _iter_v2_window(session, start, mid, status)
+        yield from _iter_v2_window(session, mid, end, status)
+        return
+    log.info("  %s window %s → %s: %d shipments.", status or "all",
+             params["created_at_start"], params["created_at_end"], total)
+    yield from _paginate_shipments(session, params, api_version="v2")
+
+
+def _iter_v2_shipments(session: requests.Session, since_dt: datetime,
+                       end_dt: Optional[datetime] = None
+                       ) -> Iterable[Dict[str, Any]]:
+    """Yield v2 shipments created in [since_dt, end_dt], one pass per
+    status in _v2_statuses(), each date window split until it fits
+    under the v2 offset cap. De-duplicated by shipment_id (window
+    edges are inclusive on both ends)."""
+    end_dt = end_dt or (datetime.now(timezone.utc) + timedelta(minutes=5))
+    seen: set = set()
+    for status in _v2_statuses():
+        for s in _iter_v2_window(session, since_dt, end_dt, status):
+            sid = s.get("shipment_id") if isinstance(s, dict) else None
+            if sid:
+                if sid in seen:
+                    continue
+                seen.add(sid)
+            yield s
+
+
+def _iter_shipments(session: requests.Session, since_dt: datetime,
+                    api_version: str) -> Iterable[Dict[str, Any]]:
+    if api_version == "v2":
+        return _iter_v2_shipments(session, since_dt)
+    return _paginate_shipments(
+        session,
+        _query_params(since_dt.strftime(_V2_TS_FMT), api_version),
+        api_version=api_version)
 
 
 # ---------------------------------------------------------------------------
@@ -692,10 +793,7 @@ def sync_recent(session: requests.Session, days: int,
     flatten = (_flatten_shipment_v2
                if api_version == "v2" else _flatten_shipment)
     rows = []
-    for s in _paginate_shipments(
-            session,
-            _query_params(since_iso, api_version),
-            api_version=api_version):
+    for s in _iter_shipments(session, since_dt, api_version):
         rows.append(flatten(s))
     if api_version == "v2" and rows:
         label_idx = _fetch_labels_index(session, since_iso)
@@ -721,10 +819,7 @@ def sync_full(session: requests.Session, days: int = 1825,
     flatten = (_flatten_shipment_v2
                if api_version == "v2" else _flatten_shipment)
     rows = []
-    for s in _paginate_shipments(
-            session,
-            _query_params(since_iso, api_version),
-            api_version=api_version):
+    for s in _iter_shipments(session, since_dt, api_version):
         rows.append(flatten(s))
     # v2 — enrich with tracking from /labels.
     if api_version == "v2" and rows:
